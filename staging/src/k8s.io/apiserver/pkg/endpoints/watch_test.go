@@ -844,7 +844,16 @@ func TestWatchHTTPTimeout(t *testing.T) {
 	close(timeoutCh)
 	select {
 	case <-done:
-		if !watcher.IsStopped() {
+		eventCh := watcher.ResultChan()
+		select {
+		case _, opened := <-eventCh:
+			if opened {
+				t.Errorf("Watcher received unexpected event")
+			}
+			if !watcher.IsStopped() {
+				t.Errorf("Watcher is not stopped")
+			}
+		case <-time.After(wait.ForeverTestTimeout):
 			t.Errorf("Leaked watch on timeout")
 		}
 	case <-time.After(wait.ForeverTestTimeout):
@@ -913,7 +922,7 @@ func runWatchHTTPBenchmark(b *testing.B, items []example.Pod) {
 	go func() {
 		defer response.Body.Close()
 		if _, err := io.Copy(ioutil.Discard, response.Body); err != nil {
-			b.Fatal(err)
+			b.Error(err)
 		}
 		wg.Done()
 	}()
@@ -953,7 +962,7 @@ func BenchmarkWatchWebsocket(b *testing.B) {
 	go func() {
 		defer ws.Close()
 		if _, err := io.Copy(ioutil.Discard, ws); err != nil {
-			b.Fatal(err)
+			b.Error(err)
 		}
 		wg.Done()
 	}()
@@ -1002,7 +1011,7 @@ func BenchmarkWatchProtobuf(b *testing.B) {
 	go func() {
 		defer response.Body.Close()
 		if _, err := io.Copy(ioutil.Discard, response.Body); err != nil {
-			b.Fatal(err)
+			b.Error(err)
 		}
 		wg.Done()
 	}()

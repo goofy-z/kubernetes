@@ -23,8 +23,8 @@ import (
 	"path/filepath"
 	"testing"
 
+	"k8s.io/mount-utils"
 	"k8s.io/utils/exec/testing"
-	"k8s.io/utils/mount"
 
 	v1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -46,7 +46,7 @@ func TestCanSupport(t *testing.T) {
 
 	plug, err := plugMgr.FindPluginByName("kubernetes.io/storageos")
 	if err != nil {
-		t.Errorf("Can't find the plugin by name")
+		t.Fatal("Can't find the plugin by name")
 	}
 	if plug.GetPluginName() != "kubernetes.io/storageos" {
 		t.Errorf("Wrong name: %s", plug.GetPluginName())

@@ -23,7 +23,6 @@ import (
 	"testing"
 
 	"github.com/pkg/errors"
-
 	"github.com/spf13/cobra"
 )
 
@@ -56,17 +55,6 @@ func RunSubCommand(t *testing.T, subCmds []*cobra.Command, command string, args 
 	subCmd.SetArgs(args)
 	if err := subCmd.Execute(); err != nil {
 		t.Fatalf("Could not execute subcommand: %s", command)
-	}
-}
-
-// AssertSubCommandHasFlags is a utility function for kubeadm testing that assert if a Cobra sub command has expected flags
-func AssertSubCommandHasFlags(t *testing.T, subCmds []*cobra.Command, command string, flags ...string) {
-	subCmd := getSubCommand(t, subCmds, command)
-
-	for _, flag := range flags {
-		if subCmd.Flags().Lookup(flag) == nil {
-			t.Errorf("Could not find expecte flag %s for command %s", flag, command)
-		}
 	}
 }
 

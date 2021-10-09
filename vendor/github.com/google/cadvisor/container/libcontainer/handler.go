@@ -16,6 +16,7 @@ package libcontainer
 
 import (
 	"bufio"
+	"bytes"
 	"encoding/json"
 	"flag"
 	"fmt"
@@ -28,15 +29,13 @@ import (
 	"strings"
 	"time"
 
-	"github.com/google/cadvisor/container"
-	info "github.com/google/cadvisor/info/v1"
-	"golang.org/x/sys/unix"
-
-	"bytes"
-
 	"github.com/opencontainers/runc/libcontainer"
 	"github.com/opencontainers/runc/libcontainer/cgroups"
+	"github.com/opencontainers/runc/libcontainer/cgroups/fs2"
 	"k8s.io/klog/v2"
+
+	"github.com/google/cadvisor/container"
+	info "github.com/google/cadvisor/info/v1"
 )
 
 var (
@@ -71,9 +70,22 @@ func NewHandler(cgroupManager cgroups.Manager, rootFs string, pid int, includedM
 
 // Get cgroup and networking stats of the specified container
 func (h *Handler) GetStats() (*info.ContainerStats, error) {
+	ignoreStatsError := false
+	if cgroups.IsCgroup2UnifiedMode() {
+		// On cgroup v2 the root cgroup stats have been introduced in recent kernel versions,
+		// so not all kernel versions have all the data. This means that stat fetching can fail
+		// due to lacking cgroup stat files, but that some data is provided.
+		if h.cgroupManager.Path("") == fs2.UnifiedMountpoint {
+			ignoreStatsError = true
+		}
+	}
+
 	cgroupStats, err := h.cgroupManager.GetStats()
 	if err != nil {
-		return nil, err
+		if !ignoreStatsError {
+			return nil, err
+		}
+		klog.V(4).Infof("Ignoring errors when gathering stats for root cgroup since some controllers don't have stats on the root cgroup: %v", err)
 	}
 	libcontainerStats := &libcontainer.Stats{
 		CgroupStats: cgroupStats,
@@ -106,56 +118,58 @@ func (h *Handler) GetStats() (*info.ContainerStats, error) {
 	}
 
 	// If we know the pid then get network stats from /proc/<pid>/net/dev
-	if h.pid == 0 {
-		return stats, nil
-	}
-	if h.includedMetrics.Has(container.NetworkUsageMetrics) {
-		netStats, err := networkStatsFromProc(h.rootFs, h.pid)
-		if err != nil {
-			klog.V(4).Infof("Unable to get network stats from pid %d: %v", h.pid, err)
-		} else {
-			stats.Network.Interfaces = append(stats.Network.Interfaces, netStats...)
+	if h.pid > 0 {
+		if h.includedMetrics.Has(container.NetworkUsageMetrics) {
+			netStats, err := networkStatsFromProc(h.rootFs, h.pid)
+			if err != nil {
+				klog.V(4).Infof("Unable to get network stats from pid %d: %v", h.pid, err)
+			} else {
+				stats.Network.Interfaces = append(stats.Network.Interfaces, netStats...)
+			}
 		}
-	}
-	if h.includedMetrics.Has(container.NetworkTcpUsageMetrics) {
-		t, err := tcpStatsFromProc(h.rootFs, h.pid, "net/tcp")
-		if err != nil {
-			klog.V(4).Infof("Unable to get tcp stats from pid %d: %v", h.pid, err)
-		} else {
-			stats.Network.Tcp = t
-		}
+		if h.includedMetrics.Has(container.NetworkTcpUsageMetrics) {
+			t, err := tcpStatsFromProc(h.rootFs, h.pid, "net/tcp")
+			if err != nil {
+				klog.V(4).Infof("Unable to get tcp stats from pid %d: %v", h.pid, err)
+			} else {
+				stats.Network.Tcp = t
+			}
 
-		t6, err := tcpStatsFromProc(h.rootFs, h.pid, "net/tcp6")
-		if err != nil {
-			klog.V(4).Infof("Unable to get tcp6 stats from pid %d: %v", h.pid, err)
-		} else {
-			stats.Network.Tcp6 = t6
-		}
+			t6, err := tcpStatsFromProc(h.rootFs, h.pid, "net/tcp6")
+			if err != nil {
+				klog.V(4).Infof("Unable to get tcp6 stats from pid %d: %v", h.pid, err)
+			} else {
+				stats.Network.Tcp6 = t6
+			}
 
-	}
-	if h.includedMetrics.Has(container.NetworkAdvancedTcpUsageMetrics) {
-		ta, err := advancedTCPStatsFromProc(h.rootFs, h.pid, "net/netstat", "net/snmp")
-		if err != nil {
-			klog.V(4).Infof("Unable to get advanced tcp stats from pid %d: %v", h.pid, err)
-		} else {
-			stats.Network.TcpAdvanced = ta
 		}
-	}
-	if h.includedMetrics.Has(container.NetworkUdpUsageMetrics) {
-		u, err := udpStatsFromProc(h.rootFs, h.pid, "net/udp")
-		if err != nil {
-			klog.V(4).Infof("Unable to get udp stats from pid %d: %v", h.pid, err)
-		} else {
-			stats.Network.Udp = u
+		if h.includedMetrics.Has(container.NetworkAdvancedTcpUsageMetrics) {
+			ta, err := advancedTCPStatsFromProc(h.rootFs, h.pid, "net/netstat", "net/snmp")
+			if err != nil {
+				klog.V(4).Infof("Unable to get advanced tcp stats from pid %d: %v", h.pid, err)
+			} else {
+				stats.Network.TcpAdvanced = ta
+			}
 		}
+		if h.includedMetrics.Has(container.NetworkUdpUsageMetrics) {
+			u, err := udpStatsFromProc(h.rootFs, h.pid, "net/udp")
+			if err != nil {
+				klog.V(4).Infof("Unable to get udp stats from pid %d: %v", h.pid, err)
+			} else {
+				stats.Network.Udp = u
+			}
 
-		u6, err := udpStatsFromProc(h.rootFs, h.pid, "net/udp6")
-		if err != nil {
-			klog.V(4).Infof("Unable to get udp6 stats from pid %d: %v", h.pid, err)
-		} else {
-			stats.Network.Udp6 = u6
+			u6, err := udpStatsFromProc(h.rootFs, h.pid, "net/udp6")
+			if err != nil {
+				klog.V(4).Infof("Unable to get udp6 stats from pid %d: %v", h.pid, err)
+			} else {
+				stats.Network.Udp6 = u6
+			}
 		}
 	}
+	// some process metrics are per container ( number of processes, number of
+	// file descriptors etc.) and not required a proper container's
+	// root PID (systemd services don't have the root PID atm)
 	if h.includedMetrics.Has(container.ProcessMetrics) {
 		paths := h.cgroupManager.GetPaths()
 		path, ok := paths["cpu"]
@@ -286,13 +300,15 @@ func processStatsFromProcs(rootFs string, cgroupPath string, rootPid int) (info.
 			}
 		}
 	}
-	ulimits := processRootProcUlimits(rootFs, rootPid)
 
 	processStats := info.ProcessStats{
 		ProcessCount: uint64(len(pids)),
 		FdCount:      fdCount,
 		SocketCount:  socketCount,
-		Ulimits:      ulimits,
+	}
+
+	if rootPid > 0 {
+		processStats.Ulimits = processRootProcUlimits(rootFs, rootPid)
 	}
 
 	return processStats, nil
@@ -742,16 +758,6 @@ func (h *Handler) GetProcesses() ([]int, error) {
 	return pids, nil
 }
 
-func minUint32(x, y uint32) uint32 {
-	if x < y {
-		return x
-	}
-	return y
-}
-
-// var to allow unit tests to stub it out
-var numCpusFunc = getNumberOnlineCPUs
-
 // Convert libcontainer stats to info.ContainerStats.
 func setCPUStats(s *cgroups.Stats, ret *info.ContainerStats, withPerCPU bool) {
 	ret.Cpu.Usage.User = s.CpuStats.CpuUsage.UsageInUsermode
@@ -769,37 +775,7 @@ func setCPUStats(s *cgroups.Stats, ret *info.ContainerStats, withPerCPU bool) {
 		// cpuacct subsystem.
 		return
 	}
-
-	numPossible := uint32(len(s.CpuStats.CpuUsage.PercpuUsage))
-	// Note that as of https://patchwork.kernel.org/patch/8607101/ (kernel v4.7),
-	// the percpu usage information includes extra zero values for all additional
-	// possible CPUs. This is to allow statistic collection after CPU-hotplug.
-	// We intentionally ignore these extra zeroes.
-	numActual, err := numCpusFunc()
-	if err != nil {
-		klog.Errorf("unable to determine number of actual cpus; defaulting to maximum possible number: errno %v", err)
-		numActual = numPossible
-	}
-	if numActual > numPossible {
-		// The real number of cores should never be greater than the number of
-		// datapoints reported in cpu usage.
-		klog.Errorf("PercpuUsage had %v cpus, but the actual number is %v; ignoring extra CPUs", numPossible, numActual)
-	}
-	numActual = minUint32(numPossible, numActual)
-	ret.Cpu.Usage.PerCpu = make([]uint64, numActual)
-
-	for i := uint32(0); i < numActual; i++ {
-		ret.Cpu.Usage.PerCpu[i] = s.CpuStats.CpuUsage.PercpuUsage[i]
-	}
-
-}
-
-func getNumberOnlineCPUs() (uint32, error) {
-	var availableCPUs unix.CPUSet
-	if err := unix.SchedGetaffinity(0, &availableCPUs); err != nil {
-		return 0, err
-	}
-	return uint32(availableCPUs.Count()), nil
+	ret.Cpu.Usage.PerCpu = s.CpuStats.CpuUsage.PercpuUsage
 }
 
 func setDiskIoStats(s *cgroups.Stats, ret *info.ContainerStats) {
@@ -818,7 +794,12 @@ func setMemoryStats(s *cgroups.Stats, ret *info.ContainerStats) {
 	ret.Memory.MaxUsage = s.MemoryStats.Usage.MaxUsage
 	ret.Memory.Failcnt = s.MemoryStats.Usage.Failcnt
 
-	if s.MemoryStats.UseHierarchy {
+	if cgroups.IsCgroup2UnifiedMode() {
+		ret.Memory.Cache = s.MemoryStats.Stats["file"]
+		ret.Memory.RSS = s.MemoryStats.Stats["anon"]
+		ret.Memory.Swap = s.MemoryStats.SwapUsage.Usage
+		ret.Memory.MappedFile = s.MemoryStats.Stats["file_mapped"]
+	} else if s.MemoryStats.UseHierarchy {
 		ret.Memory.Cache = s.MemoryStats.Stats["total_cache"]
 		ret.Memory.RSS = s.MemoryStats.Stats["total_rss"]
 		ret.Memory.Swap = s.MemoryStats.Stats["total_swap"]
@@ -838,8 +819,13 @@ func setMemoryStats(s *cgroups.Stats, ret *info.ContainerStats) {
 		ret.Memory.HierarchicalData.Pgmajfault = v
 	}
 
+	inactiveFileKeyName := "total_inactive_file"
+	if cgroups.IsCgroup2UnifiedMode() {
+		inactiveFileKeyName = "inactive_file"
+	}
+
 	workingSet := ret.Memory.Usage
-	if v, ok := s.MemoryStats.Stats["total_inactive_file"]; ok {
+	if v, ok := s.MemoryStats.Stats[inactiveFileKeyName]; ok {
 		if workingSet < v {
 			workingSet = 0
 		} else {
@@ -847,6 +833,28 @@ func setMemoryStats(s *cgroups.Stats, ret *info.ContainerStats) {
 		}
 	}
 	ret.Memory.WorkingSet = workingSet
+}
+
+func setCPUSetStats(s *cgroups.Stats, ret *info.ContainerStats) {
+	ret.CpuSet.MemoryMigrate = s.CPUSetStats.MemoryMigrate
+}
+
+func getNumaStats(memoryStats map[uint8]uint64) map[uint8]uint64 {
+	stats := make(map[uint8]uint64, len(memoryStats))
+	for node, usage := range memoryStats {
+		stats[node] = usage
+	}
+	return stats
+}
+
+func setMemoryNumaStats(s *cgroups.Stats, ret *info.ContainerStats) {
+	ret.Memory.ContainerData.NumaStats.File = getNumaStats(s.MemoryStats.PageUsageByNUMA.File.Nodes)
+	ret.Memory.ContainerData.NumaStats.Anon = getNumaStats(s.MemoryStats.PageUsageByNUMA.Anon.Nodes)
+	ret.Memory.ContainerData.NumaStats.Unevictable = getNumaStats(s.MemoryStats.PageUsageByNUMA.Unevictable.Nodes)
+
+	ret.Memory.HierarchicalData.NumaStats.File = getNumaStats(s.MemoryStats.PageUsageByNUMA.Hierarchical.File.Nodes)
+	ret.Memory.HierarchicalData.NumaStats.Anon = getNumaStats(s.MemoryStats.PageUsageByNUMA.Hierarchical.Anon.Nodes)
+	ret.Memory.HierarchicalData.NumaStats.Unevictable = getNumaStats(s.MemoryStats.PageUsageByNUMA.Hierarchical.Unevictable.Nodes)
 }
 
 func setHugepageStats(s *cgroups.Stats, ret *info.ContainerStats) {
@@ -902,8 +910,14 @@ func newContainerStats(libcontainerStats *libcontainer.Stats, includedMetrics co
 			setDiskIoStats(s, ret)
 		}
 		setMemoryStats(s, ret)
+		if includedMetrics.Has(container.MemoryNumaMetrics) {
+			setMemoryNumaStats(s, ret)
+		}
 		if includedMetrics.Has(container.HugetlbUsageMetrics) {
 			setHugepageStats(s, ret)
+		}
+		if includedMetrics.Has(container.CPUSetMetrics) {
+			setCPUSetStats(s, ret)
 		}
 	}
 	if len(libcontainerStats.Interfaces) > 0 {

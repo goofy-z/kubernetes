@@ -23,7 +23,7 @@ import (
 
 	flockerapi "github.com/clusterhq/flocker-go"
 	"github.com/stretchr/testify/assert"
-	"k8s.io/utils/mount"
+	"k8s.io/mount-utils"
 
 	v1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/types"
@@ -92,7 +92,7 @@ func (c *fakeFlockerClient) GetDatasetID(metaName string) (datasetID string, err
 	if val, ok := c.Metadata["Name"]; !ok {
 		return val, nil
 	}
-	return "", fmt.Errorf("No dataset with metadata X found")
+	return "", fmt.Errorf("no dataset with metadata X found")
 }
 
 func (c *fakeFlockerClient) GetPrimaryUUID() (primaryUUID string, err error) {

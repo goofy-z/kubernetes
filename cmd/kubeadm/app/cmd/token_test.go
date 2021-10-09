@@ -31,7 +31,10 @@ import (
 	"k8s.io/client-go/kubernetes/fake"
 	core "k8s.io/client-go/testing"
 	"k8s.io/client-go/tools/clientcmd"
+
+	bootstraptokenv1 "k8s.io/kubernetes/cmd/kubeadm/app/apis/bootstraptoken/v1"
 	kubeadmapiv1beta2 "k8s.io/kubernetes/cmd/kubeadm/app/apis/kubeadm/v1beta2"
+	kubeadmapiv1 "k8s.io/kubernetes/cmd/kubeadm/app/apis/kubeadm/v1beta3"
 	outputapischeme "k8s.io/kubernetes/cmd/kubeadm/app/apis/output/scheme"
 	outputapiv1alpha1 "k8s.io/kubernetes/cmd/kubeadm/app/apis/output/v1alpha1"
 	"k8s.io/kubernetes/cmd/kubeadm/app/util/output"
@@ -156,13 +159,13 @@ func TestRunCreateToken(t *testing.T) {
 	}
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
-			bts, err := kubeadmapiv1beta2.NewBootstrapTokenString(tc.token)
+			bts, err := bootstraptokenv1.NewBootstrapTokenString(tc.token)
 			if err != nil && len(tc.token) != 0 { // if tc.token is "" it's okay as it will be generated later at runtime
 				t.Fatalf("token couldn't be parsed for testing: %v", err)
 			}
 
-			cfg := &kubeadmapiv1beta2.InitConfiguration{
-				BootstrapTokens: []kubeadmapiv1beta2.BootstrapToken{
+			cfg := &kubeadmapiv1.InitConfiguration{
+				BootstrapTokens: []bootstraptokenv1.BootstrapToken{
 					{
 						Token:  bts,
 						TTL:    &metav1.Duration{Duration: 0},
@@ -186,7 +189,7 @@ func TestNewCmdTokenGenerate(t *testing.T) {
 	var buf bytes.Buffer
 	args := []string{}
 
-	cmd := NewCmdTokenGenerate(&buf)
+	cmd := newCmdTokenGenerate(&buf)
 	cmd.SetArgs(args)
 
 	if err := cmd.Execute(); err != nil {
@@ -242,8 +245,8 @@ func TestNewCmdToken(t *testing.T) {
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
 			// the command is created for each test so that the kubeConfigFile
-			// variable in NewCmdToken() is reset.
-			cmd := NewCmdToken(&buf, &bufErr)
+			// variable in newCmdToken() is reset.
+			cmd := newCmdToken(&buf, &bufErr)
 			if _, err = f.WriteString(tc.configToWrite); err != nil {
 				t.Errorf("Unable to write test file %q: %v", fullPath, err)
 			}
@@ -255,7 +258,7 @@ func TestNewCmdToken(t *testing.T) {
 			cmd.SetArgs(tc.args)
 			err := cmd.Execute()
 			if (err != nil) != tc.expectedError {
-				t.Errorf("Test case %q: NewCmdToken expected error: %v, saw: %v", tc.name, tc.expectedError, (err != nil))
+				t.Errorf("Test case %q: newCmdToken expected error: %v, saw: %v", tc.name, tc.expectedError, (err != nil))
 			}
 			// restore the environment variable.
 			os.Setenv(clientcmd.RecommendedConfigPathEnvVar, storedEnv)

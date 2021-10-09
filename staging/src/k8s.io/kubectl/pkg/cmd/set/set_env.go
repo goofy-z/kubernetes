@@ -38,15 +38,16 @@ import (
 	cmdutil "k8s.io/kubectl/pkg/cmd/util"
 	"k8s.io/kubectl/pkg/polymorphichelpers"
 	"k8s.io/kubectl/pkg/scheme"
+	"k8s.io/kubectl/pkg/util/i18n"
 	"k8s.io/kubectl/pkg/util/templates"
 )
 
 var (
 	validEnvNameRegexp = regexp.MustCompile("[^a-zA-Z0-9_]")
 	envResources       = `
-  	pod (po), replicationcontroller (rc), deployment (deploy), daemonset (ds), job, replicaset (rs)`
+  	pod (po), replicationcontroller (rc), deployment (deploy), daemonset (ds), statefulset (sts), cronjob (cj), replicaset (rs)`
 
-	envLong = templates.LongDesc(`
+	envLong = templates.LongDesc(i18n.T(`
 		Update environment variables on a pod template.
 
 		List environment variable definitions in one or more pods, pod templates.
@@ -59,7 +60,7 @@ var (
 		syntax.
 
 		Possible resources include (case insensitive):
-		` + envResources)
+		`) + envResources)
 
 	envExample = templates.Examples(`
           # Update deployment 'registry' with a new environment variable
@@ -150,7 +151,7 @@ func NewCmdEnv(f cmdutil.Factory, streams genericclioptions.IOStreams) *cobra.Co
 	cmd := &cobra.Command{
 		Use:                   "env RESOURCE/NAME KEY_1=VAL_1 ... KEY_N=VAL_N",
 		DisableFlagsInUseLine: true,
-		Short:                 "Update environment variables on a pod template",
+		Short:                 i18n.T("Update environment variables on a pod template"),
 		Long:                  envLong,
 		Example:               envExample,
 		Run: func(cmd *cobra.Command, args []string) {
@@ -228,11 +229,7 @@ func (o *EnvOptions) Complete(f cmdutil.Factory, cmd *cobra.Command, args []stri
 	if err != nil {
 		return err
 	}
-	discoveryClient, err := f.ToDiscoveryClient()
-	if err != nil {
-		return err
-	}
-	o.dryRunVerifier = resource.NewDryRunVerifier(dynamicClient, discoveryClient)
+	o.dryRunVerifier = resource.NewDryRunVerifier(dynamicClient, f.OpenAPIGetter())
 
 	cmdutil.PrintFlagsWithDryRunStrategy(o.PrintFlags, o.dryRunStrategy)
 	printer, err := o.PrintFlags.ToPrinter()
@@ -273,7 +270,7 @@ func (o *EnvOptions) Validate() error {
 
 // RunEnv contains all the necessary functionality for the OpenShift cli env command
 func (o *EnvOptions) RunEnv() error {
-	env, remove, err := envutil.ParseEnv(append(o.EnvParams, o.envArgs...), o.In)
+	env, remove, envFromStdin, err := envutil.ParseEnv(append(o.EnvParams, o.envArgs...), o.In)
 	if err != nil {
 		return err
 	}
@@ -292,6 +289,10 @@ func (o *EnvOptions) RunEnv() error {
 				LabelSelectorParam(o.Selector).
 				ResourceTypeOrNameArgs(o.All, o.From).
 				Latest()
+		}
+
+		if envFromStdin {
+			b = b.StdinInUse()
 		}
 
 		infos, err := b.Do().Infos()
@@ -361,6 +362,10 @@ func (o *EnvOptions) RunEnv() error {
 			Latest()
 	}
 
+	if envFromStdin {
+		b = b.StdinInUse()
+	}
+
 	infos, err := b.Do().Infos()
 	if err != nil {
 		return err
@@ -368,7 +373,9 @@ func (o *EnvOptions) RunEnv() error {
 	patches := CalculatePatches(infos, scheme.DefaultJSONEncoder(), func(obj runtime.Object) ([]byte, error) {
 		_, err := o.updatePodSpecForObject(obj, func(spec *v1.PodSpec) error {
 			resolutionErrorsEncountered := false
+			initContainers, _ := selectContainers(spec.InitContainers, o.ContainerSelector)
 			containers, _ := selectContainers(spec.Containers, o.ContainerSelector)
+			containers = append(containers, initContainers...)
 			objName, err := meta.NewAccessor().Name(obj)
 			if err != nil {
 				return err

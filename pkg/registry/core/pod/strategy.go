@@ -26,6 +26,7 @@ import (
 	"strings"
 	"time"
 
+	v1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/fields"
@@ -45,9 +46,9 @@ import (
 	api "k8s.io/kubernetes/pkg/apis/core"
 	"k8s.io/kubernetes/pkg/apis/core/helper/qos"
 	"k8s.io/kubernetes/pkg/apis/core/validation"
-	"k8s.io/kubernetes/pkg/features"
 	"k8s.io/kubernetes/pkg/kubelet/client"
 	proxyutil "k8s.io/kubernetes/pkg/proxy/util"
+	"sigs.k8s.io/structured-merge-diff/v4/fieldpath"
 )
 
 // podStrategy implements behavior for Pods
@@ -65,6 +66,18 @@ func (podStrategy) NamespaceScoped() bool {
 	return true
 }
 
+// GetResetFields returns the set of fields that get reset by the strategy
+// and should not be modified by the user.
+func (podStrategy) GetResetFields() map[fieldpath.APIVersion]*fieldpath.Set {
+	fields := map[fieldpath.APIVersion]*fieldpath.Set{
+		"v1": fieldpath.NewSet(
+			fieldpath.MakePathOrDie("status"),
+		),
+	}
+
+	return fields
+}
+
 // PrepareForCreate clears fields that are not allowed to be set by end users on creation.
 func (podStrategy) PrepareForCreate(ctx context.Context, obj runtime.Object) {
 	pod := obj.(*api.Pod)
@@ -74,6 +87,8 @@ func (podStrategy) PrepareForCreate(ctx context.Context, obj runtime.Object) {
 	}
 
 	podutil.DropDisabledPodFields(pod, nil)
+
+	applySeccompVersionSkew(pod)
 }
 
 // PrepareForUpdate clears fields that are not allowed to be set by end users on update.
@@ -88,13 +103,13 @@ func (podStrategy) PrepareForUpdate(ctx context.Context, obj, old runtime.Object
 // Validate validates a new pod.
 func (podStrategy) Validate(ctx context.Context, obj runtime.Object) field.ErrorList {
 	pod := obj.(*api.Pod)
-	opts := validation.PodValidationOptions{
-		// Allow multiple huge pages on pod create if feature is enabled
-		AllowMultipleHugePageResources: utilfeature.DefaultFeatureGate.Enabled(features.HugePageStorageMediumSize),
-	}
-	allErrs := validation.ValidatePodCreate(pod, opts)
-	allErrs = append(allErrs, validation.ValidateConditionalPod(pod, nil, field.NewPath(""))...)
-	return allErrs
+	opts := podutil.GetValidationOptionsFromPodSpecAndMeta(&pod.Spec, nil, &pod.ObjectMeta, nil)
+	return validation.ValidatePodCreate(pod, opts)
+}
+
+// WarningsOnCreate returns warnings for the creation of the given object.
+func (podStrategy) WarningsOnCreate(ctx context.Context, obj runtime.Object) []string {
+	return podutil.GetWarningsForPod(ctx, obj.(*api.Pod), nil)
 }
 
 // Canonicalize normalizes the object after validation.
@@ -108,14 +123,18 @@ func (podStrategy) AllowCreateOnUpdate() bool {
 
 // ValidateUpdate is the default update validation for an end user.
 func (podStrategy) ValidateUpdate(ctx context.Context, obj, old runtime.Object) field.ErrorList {
-	oldFailsSingleHugepagesValidation := len(validation.ValidatePodSingleHugePageResources(old.(*api.Pod), field.NewPath("spec"))) > 0
-	opts := validation.PodValidationOptions{
-		// Allow multiple huge pages on pod create if feature is enabled or if the old pod already has multiple hugepages specified
-		AllowMultipleHugePageResources: oldFailsSingleHugepagesValidation || utilfeature.DefaultFeatureGate.Enabled(features.HugePageStorageMediumSize),
-	}
-	errorList := validation.ValidatePodUpdate(obj.(*api.Pod), old.(*api.Pod), opts)
-	errorList = append(errorList, validation.ValidateConditionalPod(obj.(*api.Pod), old.(*api.Pod), field.NewPath(""))...)
-	return errorList
+	// Allow downward api usage of hugepages on pod update if feature is enabled or if the old pod already had used them.
+	pod := obj.(*api.Pod)
+	oldPod := old.(*api.Pod)
+	opts := podutil.GetValidationOptionsFromPodSpecAndMeta(&pod.Spec, &oldPod.Spec, &pod.ObjectMeta, &oldPod.ObjectMeta)
+	return validation.ValidatePodUpdate(obj.(*api.Pod), old.(*api.Pod), opts)
+}
+
+// WarningsOnUpdate returns warnings for the given update.
+func (podStrategy) WarningsOnUpdate(ctx context.Context, obj, old runtime.Object) []string {
+	// skip warnings on pod update, since humans don't typically interact directly with pods,
+	// and we don't want to pay the evaluation cost on what might be a high-frequency update path
+	return nil
 }
 
 // AllowUnconditionalUpdate allows pods to be overwritten
@@ -148,6 +167,11 @@ func (podStrategy) CheckGracefulDelete(ctx context.Context, obj runtime.Object, 
 	if pod.Status.Phase == api.PodFailed || pod.Status.Phase == api.PodSucceeded {
 		period = 0
 	}
+
+	if period < 0 {
+		period = 1
+	}
+
 	// ensure the options and the pod are in sync
 	options.GracePeriodSeconds = &period
 	return true
@@ -159,6 +183,18 @@ type podStatusStrategy struct {
 
 // StatusStrategy wraps and exports the used podStrategy for the storage package.
 var StatusStrategy = podStatusStrategy{Strategy}
+
+// GetResetFields returns the set of fields that get reset by the strategy
+// and should not be modified by the user.
+func (podStatusStrategy) GetResetFields() map[fieldpath.APIVersion]*fieldpath.Set {
+	return map[fieldpath.APIVersion]*fieldpath.Set{
+		"v1": fieldpath.NewSet(
+			fieldpath.MakePathOrDie("spec"),
+			fieldpath.MakePathOrDie("metadata", "deletionTimestamp"),
+			fieldpath.MakePathOrDie("metadata", "ownerReferences"),
+		),
+	}
+}
 
 func (podStatusStrategy) PrepareForUpdate(ctx context.Context, obj, old runtime.Object) {
 	newPod := obj.(*api.Pod)
@@ -172,7 +208,16 @@ func (podStatusStrategy) PrepareForUpdate(ctx context.Context, obj, old runtime.
 }
 
 func (podStatusStrategy) ValidateUpdate(ctx context.Context, obj, old runtime.Object) field.ErrorList {
-	return validation.ValidatePodStatusUpdate(obj.(*api.Pod), old.(*api.Pod))
+	pod := obj.(*api.Pod)
+	oldPod := old.(*api.Pod)
+	opts := podutil.GetValidationOptionsFromPodSpecAndMeta(&pod.Spec, &oldPod.Spec, &pod.ObjectMeta, &oldPod.ObjectMeta)
+
+	return validation.ValidatePodStatusUpdate(obj.(*api.Pod), old.(*api.Pod), opts)
+}
+
+// WarningsOnUpdate returns warnings for the given update.
+func (podStatusStrategy) WarningsOnUpdate(ctx context.Context, obj, old runtime.Object) []string {
+	return nil
 }
 
 type podEphemeralContainersStrategy struct {
@@ -182,8 +227,35 @@ type podEphemeralContainersStrategy struct {
 // EphemeralContainersStrategy wraps and exports the used podStrategy for the storage package.
 var EphemeralContainersStrategy = podEphemeralContainersStrategy{Strategy}
 
+// dropNonEphemeralContainerUpdates discards all changes except for pod.Spec.EphemeralContainers and certain metadata
+func dropNonEphemeralContainerUpdates(newPod, oldPod *api.Pod) *api.Pod {
+	pod := oldPod.DeepCopy()
+	pod.Name = newPod.Name
+	pod.Namespace = newPod.Namespace
+	pod.ResourceVersion = newPod.ResourceVersion
+	pod.UID = newPod.UID
+	pod.Spec.EphemeralContainers = newPod.Spec.EphemeralContainers
+	return pod
+}
+
+func (podEphemeralContainersStrategy) PrepareForUpdate(ctx context.Context, obj, old runtime.Object) {
+	newPod := obj.(*api.Pod)
+	oldPod := old.(*api.Pod)
+
+	*newPod = *dropNonEphemeralContainerUpdates(newPod, oldPod)
+	podutil.DropDisabledPodFields(newPod, oldPod)
+}
+
 func (podEphemeralContainersStrategy) ValidateUpdate(ctx context.Context, obj, old runtime.Object) field.ErrorList {
-	return validation.ValidatePodEphemeralContainersUpdate(obj.(*api.Pod), old.(*api.Pod))
+	newPod := obj.(*api.Pod)
+	oldPod := old.(*api.Pod)
+	opts := podutil.GetValidationOptionsFromPodSpecAndMeta(&newPod.Spec, &oldPod.Spec, &newPod.ObjectMeta, &oldPod.ObjectMeta)
+	return validation.ValidatePodEphemeralContainersUpdate(newPod, oldPod, opts)
+}
+
+// WarningsOnUpdate returns warnings for the given update.
+func (podEphemeralContainersStrategy) WarningsOnUpdate(ctx context.Context, obj, old runtime.Object) []string {
+	return nil
 }
 
 // GetAttrs returns labels and fields of a given object for filtering purposes.
@@ -313,7 +385,13 @@ func ResourceLocation(ctx context.Context, getter ResourceGetter, rt http.RoundT
 		Scheme: scheme,
 	}
 	if port == "" {
-		loc.Host = podIP
+		// when using an ipv6 IP as a hostname in a URL, it must be wrapped in [...]
+		// net.JoinHostPort does this for you.
+		if strings.Contains(podIP, ":") {
+			loc.Host = "[" + podIP + "]"
+		} else {
+			loc.Host = podIP
+		}
 	} else {
 		loc.Host = net.JoinHostPort(podIP, port)
 	}
@@ -378,7 +456,7 @@ func LogLocation(
 		RawQuery: params.Encode(),
 	}
 
-	if opts.InsecureSkipTLSVerifyBackend && utilfeature.DefaultFeatureGate.Enabled(features.AllowInsecureBackendProxy) {
+	if opts.InsecureSkipTLSVerifyBackend {
 		return loc, nodeInfo.InsecureSkipTLSVerifyTransport, nil
 	}
 	return loc, nodeInfo.Transport, nil
@@ -567,4 +645,75 @@ func validateContainer(container string, pod *api.Pod) (string, error) {
 	}
 
 	return container, nil
+}
+
+// applySeccompVersionSkew implements the version skew behavior described in:
+// https://github.com/kubernetes/enhancements/tree/master/keps/sig-node/135-seccomp#version-skew-strategy
+func applySeccompVersionSkew(pod *api.Pod) {
+	// get possible annotation and field
+	annotation, hasAnnotation := pod.Annotations[v1.SeccompPodAnnotationKey]
+	field, hasField := (*api.SeccompProfile)(nil), false
+
+	if pod.Spec.SecurityContext != nil && pod.Spec.SecurityContext.SeccompProfile != nil {
+		field = pod.Spec.SecurityContext.SeccompProfile
+		hasField = true
+	}
+
+	// sync field and annotation
+	if hasField && !hasAnnotation {
+		newAnnotation := podutil.SeccompAnnotationForField(field)
+
+		if newAnnotation != "" {
+			if pod.Annotations == nil {
+				pod.Annotations = map[string]string{}
+			}
+			pod.Annotations[v1.SeccompPodAnnotationKey] = newAnnotation
+		}
+	} else if hasAnnotation && !hasField {
+		newField := podutil.SeccompFieldForAnnotation(annotation)
+
+		if newField != nil {
+			if pod.Spec.SecurityContext == nil {
+				pod.Spec.SecurityContext = &api.PodSecurityContext{}
+			}
+			pod.Spec.SecurityContext.SeccompProfile = newField
+		}
+	}
+
+	// Handle the containers of the pod
+	podutil.VisitContainers(&pod.Spec, podutil.AllFeatureEnabledContainers(),
+		func(ctr *api.Container, _ podutil.ContainerType) bool {
+			// get possible annotation and field
+			key := api.SeccompContainerAnnotationKeyPrefix + ctr.Name
+			annotation, hasAnnotation := pod.Annotations[key]
+
+			field, hasField := (*api.SeccompProfile)(nil), false
+			if ctr.SecurityContext != nil && ctr.SecurityContext.SeccompProfile != nil {
+				field = ctr.SecurityContext.SeccompProfile
+				hasField = true
+			}
+
+			// sync field and annotation
+			if hasField && !hasAnnotation {
+				newAnnotation := podutil.SeccompAnnotationForField(field)
+
+				if newAnnotation != "" {
+					if pod.Annotations == nil {
+						pod.Annotations = map[string]string{}
+					}
+					pod.Annotations[key] = newAnnotation
+				}
+			} else if hasAnnotation && !hasField {
+				newField := podutil.SeccompFieldForAnnotation(annotation)
+
+				if newField != nil {
+					if ctr.SecurityContext == nil {
+						ctr.SecurityContext = &api.SecurityContext{}
+					}
+					ctr.SecurityContext.SeccompProfile = newField
+				}
+			}
+
+			return true
+		})
 }

@@ -32,9 +32,10 @@ import (
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/util/uuid"
+	kubeletpodresourcesv1 "k8s.io/kubelet/pkg/apis/podresources/v1"
+	kubeletpodresourcesv1alpha1 "k8s.io/kubelet/pkg/apis/podresources/v1alpha1"
 	"k8s.io/kubernetes/pkg/features"
 	kubeletconfig "k8s.io/kubernetes/pkg/kubelet/apis/config"
-	kubeletpodresourcesv1alpha1 "k8s.io/kubernetes/pkg/kubelet/apis/podresources/v1alpha1"
 	"k8s.io/kubernetes/test/e2e/framework"
 	e2enode "k8s.io/kubernetes/test/e2e/framework/node"
 	e2epod "k8s.io/kubernetes/test/e2e/framework/pod"
@@ -62,7 +63,7 @@ var (
 )
 
 // Serial because the test restarts Kubelet
-var _ = framework.KubeDescribe("Device Plugin [Feature:DevicePluginProbe][NodeFeature:DevicePluginProbe][Serial]", func() {
+var _ = SIGDescribe("Device Plugin [Feature:DevicePluginProbe][NodeFeature:DevicePluginProbe][Serial]", func() {
 	f := framework.NewDefaultFramework("device-plugin-errors")
 	testDevicePlugin(f, "/var/lib/kubelet/plugins_registry")
 })
@@ -80,7 +81,12 @@ func numberOfSampleResources(node *v1.Node) int64 {
 
 // getSampleDevicePluginPod returns the Device Plugin pod for sample resources in e2e tests.
 func getSampleDevicePluginPod() *v1.Pod {
-	ds := readDaemonSetV1OrDie(e2etestfiles.ReadOrDie(sampleDevicePluginDSYAML))
+	data, err := e2etestfiles.Read(sampleDevicePluginDSYAML)
+	if err != nil {
+		framework.Fail(err.Error())
+	}
+
+	ds := readDaemonSetV1OrDie(data)
 	p := &v1.Pod{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      sampleDevicePluginName,
@@ -113,7 +119,7 @@ func testDevicePlugin(f *framework.Framework, pluginSockDir string) {
 			}
 			initialConfig.FeatureGates[string(features.KubeletPodResources)] = true
 		})
-		ginkgo.It("Verifies the Kubelet device plugin functionality.", func() {
+		ginkgo.It("[Flaky] Verifies the Kubelet device plugin functionality.", func() {
 			ginkgo.By("Wait for node is ready to start with")
 			e2enode.WaitForNodeToBeReady(f.ClientSet, framework.TestContext.NodeName, 5*time.Minute)
 			dp := getSampleDevicePluginPod()
@@ -152,25 +158,56 @@ func testDevicePlugin(f *framework.Framework, pluginSockDir string) {
 			devID1 := parseLog(f, pod1.Name, pod1.Name, deviceIDRE)
 			gomega.Expect(devID1).To(gomega.Not(gomega.Equal("")))
 
-			podResources, err := getNodeDevices()
-			var resourcesForOurPod *kubeletpodresourcesv1alpha1.PodResources
-			framework.Logf("pod resources %v", podResources)
+			v1alphaPodResources, err := getV1alpha1NodeDevices()
 			framework.ExpectNoError(err)
-			framework.ExpectEqual(len(podResources.PodResources), 2)
-			for _, res := range podResources.GetPodResources() {
+			framework.Logf("v1alpha pod resources %v", v1alphaPodResources)
+
+			v1PodResources, err := getV1NodeDevices()
+			framework.ExpectNoError(err)
+			framework.Logf("v1 pod resources %v", v1PodResources)
+
+			framework.ExpectEqual(len(v1alphaPodResources.PodResources), 2)
+			framework.ExpectEqual(len(v1PodResources.PodResources), 2)
+
+			var v1alphaResourcesForOurPod *kubeletpodresourcesv1alpha1.PodResources
+			for _, res := range v1alphaPodResources.GetPodResources() {
 				if res.Name == pod1.Name {
-					resourcesForOurPod = res
+					v1alphaResourcesForOurPod = res
 				}
 			}
-			framework.Logf("resourcesForOurPod %v", resourcesForOurPod)
-			gomega.Expect(resourcesForOurPod).NotTo(gomega.BeNil())
-			framework.ExpectEqual(resourcesForOurPod.Name, pod1.Name)
-			framework.ExpectEqual(resourcesForOurPod.Namespace, pod1.Namespace)
-			framework.ExpectEqual(len(resourcesForOurPod.Containers), 1)
-			framework.ExpectEqual(resourcesForOurPod.Containers[0].Name, pod1.Spec.Containers[0].Name)
-			framework.ExpectEqual(len(resourcesForOurPod.Containers[0].Devices), 1)
-			framework.ExpectEqual(resourcesForOurPod.Containers[0].Devices[0].ResourceName, resourceName)
-			framework.ExpectEqual(len(resourcesForOurPod.Containers[0].Devices[0].DeviceIds), 1)
+			framework.Logf("v1alphaResourcesForOurPod %v", v1alphaResourcesForOurPod)
+
+			var v1ResourcesForOurPod *kubeletpodresourcesv1.PodResources
+			for _, res := range v1PodResources.GetPodResources() {
+				if res.Name == pod1.Name {
+					v1ResourcesForOurPod = res
+				}
+			}
+			framework.Logf("v1ResourcesForOurPod %v", v1ResourcesForOurPod)
+
+			gomega.Expect(v1alphaResourcesForOurPod).NotTo(gomega.BeNil())
+			gomega.Expect(v1ResourcesForOurPod).NotTo(gomega.BeNil())
+
+			framework.ExpectEqual(v1alphaResourcesForOurPod.Name, pod1.Name)
+			framework.ExpectEqual(v1ResourcesForOurPod.Name, pod1.Name)
+
+			framework.ExpectEqual(v1alphaResourcesForOurPod.Namespace, pod1.Namespace)
+			framework.ExpectEqual(v1ResourcesForOurPod.Namespace, pod1.Namespace)
+
+			framework.ExpectEqual(len(v1alphaResourcesForOurPod.Containers), 1)
+			framework.ExpectEqual(len(v1ResourcesForOurPod.Containers), 1)
+
+			framework.ExpectEqual(v1alphaResourcesForOurPod.Containers[0].Name, pod1.Spec.Containers[0].Name)
+			framework.ExpectEqual(v1ResourcesForOurPod.Containers[0].Name, pod1.Spec.Containers[0].Name)
+
+			framework.ExpectEqual(len(v1alphaResourcesForOurPod.Containers[0].Devices), 1)
+			framework.ExpectEqual(len(v1ResourcesForOurPod.Containers[0].Devices), 1)
+
+			framework.ExpectEqual(v1alphaResourcesForOurPod.Containers[0].Devices[0].ResourceName, resourceName)
+			framework.ExpectEqual(v1ResourcesForOurPod.Containers[0].Devices[0].ResourceName, resourceName)
+
+			framework.ExpectEqual(len(v1alphaResourcesForOurPod.Containers[0].Devices[0].DeviceIds), 1)
+			framework.ExpectEqual(len(v1ResourcesForOurPod.Containers[0].Devices[0].DeviceIds), 1)
 
 			pod1, err = f.PodClient().Get(context.TODO(), pod1.Name, metav1.GetOptions{})
 			framework.ExpectNoError(err)
@@ -216,7 +253,7 @@ func testDevicePlugin(f *framework.Framework, pluginSockDir string) {
 			framework.ExpectNoError(err)
 
 			ensurePodContainerRestart(f, pod1.Name, pod1.Name)
-			ginkgo.By("Confirming that after a kubelet restart, fake-device assignement is kept")
+			ginkgo.By("Confirming that after a kubelet restart, fake-device assignment is kept")
 			devIDRestart1 := parseLog(f, pod1.Name, pod1.Name, deviceIDRE)
 			framework.ExpectEqual(devIDRestart1, devID1)
 

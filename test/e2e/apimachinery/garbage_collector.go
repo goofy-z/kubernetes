@@ -25,7 +25,6 @@ import (
 
 	appsv1 "k8s.io/api/apps/v1"
 	batchv1 "k8s.io/api/batch/v1"
-	batchv1beta1 "k8s.io/api/batch/v1beta1"
 	v1 "k8s.io/api/core/v1"
 	apiextensionsv1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
 	apiextensionsclientset "k8s.io/apiextensions-apiserver/pkg/client/clientset/clientset"
@@ -43,7 +42,6 @@ import (
 	e2emetrics "k8s.io/kubernetes/test/e2e/framework/metrics"
 	e2enode "k8s.io/kubernetes/test/e2e/framework/node"
 	e2epod "k8s.io/kubernetes/test/e2e/framework/pod"
-	e2eskipper "k8s.io/kubernetes/test/e2e/framework/skipper"
 
 	"github.com/onsi/ginkgo"
 	imageutils "k8s.io/kubernetes/test/utils/image"
@@ -108,9 +106,6 @@ var (
 	// This timeout covers two resync/retry periods, and should be added to wait timeouts to account for delays
 	// to the GC controller caused by API changes in other tests.
 	gcInformerResyncRetryTimeout = time.Minute
-
-	// CronJobGroupVersionResource unambiguously identifies a CronJob resource.
-	CronJobGroupVersionResource = schema.GroupVersionResource{Group: batchv1beta1.GroupName, Version: "v1beta1", Resource: "cronjobs"}
 )
 
 func getPodTemplateSpec(labels map[string]string) v1.PodTemplateSpec {
@@ -231,7 +226,7 @@ func verifyRemainingObjects(f *framework.Framework, objects map[string]int) (boo
 				ginkgo.By(fmt.Sprintf("expected %d RCs, got %d RCs", num, len(rcs.Items)))
 			}
 		case "CronJobs":
-			cronJobs, err := f.ClientSet.BatchV1beta1().CronJobs(f.Namespace.Name).List(context.TODO(), metav1.ListOptions{})
+			cronJobs, err := f.ClientSet.BatchV1().CronJobs(f.Namespace.Name).List(context.TODO(), metav1.ListOptions{})
 			if err != nil {
 				return false, fmt.Errorf("failed to list cronjobs: %v", err)
 			}
@@ -259,7 +254,7 @@ func verifyRemainingObjects(f *framework.Framework, objects map[string]int) (boo
 func gatherMetrics(f *framework.Framework) {
 	ginkgo.By("Gathering metrics")
 	var summary framework.TestDataSummary
-	grabber, err := e2emetrics.NewMetricsGrabber(f.ClientSet, f.KubemarkExternalClusterClientSet, false, false, true, false, false)
+	grabber, err := e2emetrics.NewMetricsGrabber(f.ClientSet, f.KubemarkExternalClusterClientSet, f.ClientConfig(), false, false, true, false, false, false)
 	if err != nil {
 		framework.Logf("Failed to create MetricsGrabber. Skipping metrics gathering.")
 	} else {
@@ -273,19 +268,19 @@ func gatherMetrics(f *framework.Framework) {
 	}
 }
 
-func newCronJob(name, schedule string) *batchv1beta1.CronJob {
+func newCronJob(name, schedule string) *batchv1.CronJob {
 	parallelism := int32(1)
 	completions := int32(1)
-	return &batchv1beta1.CronJob{
+	return &batchv1.CronJob{
 		ObjectMeta: metav1.ObjectMeta{
 			Name: name,
 		},
 		TypeMeta: metav1.TypeMeta{
 			Kind: "CronJob",
 		},
-		Spec: batchv1beta1.CronJobSpec{
+		Spec: batchv1.CronJobSpec{
 			Schedule: schedule,
-			JobTemplate: batchv1beta1.JobTemplateSpec{
+			JobTemplate: batchv1.JobTemplateSpec{
 				Spec: batchv1.JobSpec{
 					Parallelism: &parallelism,
 					Completions: &completions,
@@ -320,7 +315,7 @@ var _ = SIGDescribe("Garbage collector", func() {
 	f := framework.NewDefaultFramework("gc")
 
 	/*
-		Release : v1.9
+		Release: v1.9
 		Testname: Garbage Collector, delete replication controller, propagation policy background
 		Description: Create a replication controller with 2 Pods. Once RC is created and the first Pod is created, delete RC with deleteOptions.PropagationPolicy set to Background. Deleting the Replication Controller MUST cause pods created by that RC to be deleted.
 	*/
@@ -378,7 +373,7 @@ var _ = SIGDescribe("Garbage collector", func() {
 	})
 
 	/*
-		Release : v1.9
+		Release: v1.9
 		Testname: Garbage Collector, delete replication controller, propagation policy orphan
 		Description: Create a replication controller with maximum allocatable Pods between 10 and 100 replicas. Once RC is created and the all Pods are created, delete RC with deleteOptions.PropagationPolicy set to Orphan. Deleting the Replication Controller MUST cause pods created by that RC to be orphaned.
 	*/
@@ -499,7 +494,7 @@ var _ = SIGDescribe("Garbage collector", func() {
 	})
 
 	/*
-		Release : v1.9
+		Release: v1.9
 		Testname: Garbage Collector, delete deployment,  propagation policy background
 		Description: Create a deployment with a replicaset. Once replicaset is created , delete the deployment  with deleteOptions.PropagationPolicy set to Background. Deleting the deployment MUST delete the replicaset created by the deployment and also the Pods that belong to the deployments MUST be deleted.
 	*/
@@ -558,7 +553,7 @@ var _ = SIGDescribe("Garbage collector", func() {
 	})
 
 	/*
-		Release : v1.9
+		Release: v1.9
 		Testname: Garbage Collector, delete deployment, propagation policy orphan
 		Description: Create a deployment with a replicaset. Once replicaset is created , delete the deployment  with deleteOptions.PropagationPolicy set to Orphan. Deleting the deployment MUST cause the replicaset created by the deployment to be orphaned, also the Pods created by the deployments MUST be orphaned.
 	*/
@@ -576,16 +571,32 @@ var _ = SIGDescribe("Garbage collector", func() {
 		}
 		// wait for deployment to create some rs
 		ginkgo.By("Wait for the Deployment to create new ReplicaSet")
+		var replicaset appsv1.ReplicaSet
 		err = wait.PollImmediate(500*time.Millisecond, 1*time.Minute, func() (bool, error) {
 			rsList, err := rsClient.List(context.TODO(), metav1.ListOptions{})
 			if err != nil {
 				return false, fmt.Errorf("failed to list rs: %v", err)
 			}
-			return len(rsList.Items) > 0, nil
+			if len(rsList.Items) > 0 {
+				replicaset = rsList.Items[0]
+				return true, nil
+			}
+			return false, nil
 
 		})
 		if err != nil {
 			framework.Failf("Failed to wait for the Deployment to create some ReplicaSet: %v", err)
+		}
+
+		desiredGeneration := replicaset.Generation
+		if err := wait.PollImmediate(100*time.Millisecond, 60*time.Second, func() (bool, error) {
+			newRS, err := clientSet.AppsV1().ReplicaSets(replicaset.Namespace).Get(context.TODO(), replicaset.Name, metav1.GetOptions{})
+			if err != nil {
+				return false, err
+			}
+			return newRS.Status.ObservedGeneration >= desiredGeneration && newRS.Status.Replicas == *replicaset.Spec.Replicas, nil
+		}); err != nil {
+			framework.Failf("failed to verify .Status.Replicas is equal to .Spec.Replicas for replicaset %q: %v", replicaset.Name, err)
 		}
 
 		ginkgo.By("delete the deployment")
@@ -642,7 +653,7 @@ var _ = SIGDescribe("Garbage collector", func() {
 	})
 
 	/*
-		Release : v1.9
+		Release: v1.9
 		Testname: Garbage Collector, delete replication controller, after owned pods
 		Description: Create a replication controller with maximum allocatable Pods between 10 and 100 replicas. Once RC is created and the all Pods are created, delete RC with deleteOptions.PropagationPolicy set to Foreground. Deleting the Replication Controller MUST cause pods created by that RC to be deleted before the RC is deleted.
 	*/
@@ -727,7 +738,7 @@ var _ = SIGDescribe("Garbage collector", func() {
 
 	// TODO: this should be an integration test
 	/*
-		Release : v1.9
+		Release: v1.9
 		Testname: Garbage Collector, multiple owners
 		Description: Create a replication controller RC1, with maximum allocatable Pods between 10 and 100 replicas. Create second replication controller RC2 and set RC2 as owner for half of those replicas. Once RC1 is created and the all Pods are created, delete RC1 with deleteOptions.PropagationPolicy set to Foreground. Half of the Pods that has RC2 as owner MUST not be deleted but have a deletion timestamp. Deleting the Replication Controller MUST not delete Pods that are owned by multiple replication controllers.
 	*/
@@ -841,7 +852,7 @@ var _ = SIGDescribe("Garbage collector", func() {
 
 	// TODO: should be an integration test
 	/*
-		Release : v1.9
+		Release: v1.9
 		Testname: Garbage Collector, dependency cycle
 		Description: Create three pods, patch them with Owner references such that pod1 has pod3, pod2 has pod1 and pod3 has pod2 as owner references respectively. Delete pod1 MUST delete all pods. The dependency cycle MUST not block the garbage collection.
 	*/
@@ -1142,11 +1153,10 @@ var _ = SIGDescribe("Garbage collector", func() {
 	})
 
 	ginkgo.It("should delete jobs and pods created by cronjob", func() {
-		e2eskipper.SkipIfMissingResource(f.DynamicClient, CronJobGroupVersionResource, f.Namespace.Name)
 
 		ginkgo.By("Create the cronjob")
 		cronJob := newCronJob("simple", "*/1 * * * ?")
-		cronJob, err := f.ClientSet.BatchV1beta1().CronJobs(f.Namespace.Name).Create(context.TODO(), cronJob, metav1.CreateOptions{})
+		cronJob, err := f.ClientSet.BatchV1().CronJobs(f.Namespace.Name).Create(context.TODO(), cronJob, metav1.CreateOptions{})
 		framework.ExpectNoError(err, "failed to create cronjob: %+v, in namespace: %s", cronJob, f.Namespace.Name)
 
 		ginkgo.By("Wait for the CronJob to create new Job")
@@ -1162,7 +1172,7 @@ var _ = SIGDescribe("Garbage collector", func() {
 		}
 
 		ginkgo.By("Delete the cronjob")
-		if err := f.ClientSet.BatchV1beta1().CronJobs(f.Namespace.Name).Delete(context.TODO(), cronJob.Name, getBackgroundOptions()); err != nil {
+		if err := f.ClientSet.BatchV1().CronJobs(f.Namespace.Name).Delete(context.TODO(), cronJob.Name, getBackgroundOptions()); err != nil {
 			framework.Failf("Failed to delete the CronJob: %v", err)
 		}
 		ginkgo.By("Verify if cronjob does not leave jobs nor pods behind")

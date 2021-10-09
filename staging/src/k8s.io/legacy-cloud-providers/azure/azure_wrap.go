@@ -1,3 +1,4 @@
+//go:build !providerless
 // +build !providerless
 
 /*
@@ -62,7 +63,7 @@ func checkResourceExistsFromError(err *retry.Error) (bool, *retry.Error) {
 }
 
 /// getVirtualMachine calls 'VirtualMachinesClient.Get' with a timed cache
-/// The service side has throttling control that delays responses if there're multiple requests onto certain vm
+/// The service side has throttling control that delays responses if there are multiple requests onto certain vm
 /// resource request in short period.
 func (az *Cloud) getVirtualMachine(nodeName types.NodeName, crt azcache.AzureCacheReadType) (vm compute.VirtualMachine, err error) {
 	vmName := string(nodeName)

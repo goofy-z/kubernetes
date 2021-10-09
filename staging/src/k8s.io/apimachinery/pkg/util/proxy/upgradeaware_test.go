@@ -85,6 +85,7 @@ func (fakeConn) SetWriteDeadline(t time.Time) error { return nil }
 
 type SimpleBackendHandler struct {
 	requestURL     url.URL
+	requestHost    string
 	requestHeader  http.Header
 	requestBody    []byte
 	requestMethod  string
@@ -95,6 +96,7 @@ type SimpleBackendHandler struct {
 
 func (s *SimpleBackendHandler) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 	s.requestURL = *req.URL
+	s.requestHost = req.Host
 	s.requestHeader = req.Header
 	s.requestMethod = req.Method
 	var err error
@@ -161,7 +163,9 @@ func TestServeHTTP(t *testing.T) {
 		expectedRespHeader    map[string]string
 		notExpectedRespHeader []string
 		upgradeRequired       bool
+		appendLocationPath    bool
 		expectError           func(err error) bool
+		useLocationHost       bool
 	}{
 		{
 			name:         "root path, simple get",
@@ -222,6 +226,48 @@ func TestServeHTTP(t *testing.T) {
 				"Access-Control-Allow-Methods",
 			},
 		},
+		{
+			name:            "use location host",
+			method:          "GET",
+			requestPath:     "/some/path",
+			expectedPath:    "/some/path",
+			useLocationHost: true,
+		},
+		{
+			name:            "use location host - invalid upgrade",
+			method:          "GET",
+			upgradeRequired: true,
+			requestHeader: map[string]string{
+				httpstream.HeaderConnection: httpstream.HeaderUpgrade,
+			},
+			expectError: func(err error) bool {
+				return err != nil && strings.Contains(err.Error(), "invalid upgrade response: status code 200")
+			},
+			requestPath:     "/some/path",
+			expectedPath:    "/some/path",
+			useLocationHost: true,
+		},
+		{
+			name:               "append server path to request path",
+			method:             "GET",
+			requestPath:        "/base",
+			expectedPath:       "/base/base",
+			appendLocationPath: true,
+		},
+		{
+			name:               "append server path to request path with ending slash",
+			method:             "GET",
+			requestPath:        "/base/",
+			expectedPath:       "/base/base/",
+			appendLocationPath: true,
+		},
+		{
+			name:               "don't append server path to request path",
+			method:             "GET",
+			requestPath:        "/base",
+			expectedPath:       "/base",
+			appendLocationPath: false,
+		},
 	}
 
 	for i, test := range tests {
@@ -244,6 +290,8 @@ func TestServeHTTP(t *testing.T) {
 			backendURL, _ := url.Parse(backendServer.URL)
 			backendURL.Path = test.requestPath
 			proxyHandler := NewUpgradeAwareHandler(backendURL, nil, false, test.upgradeRequired, responder)
+			proxyHandler.UseLocationHost = test.useLocationHost
+			proxyHandler.AppendLocationPath = test.appendLocationPath
 			proxyServer := httptest.NewServer(proxyHandler)
 			defer proxyServer.Close()
 			proxyURL, _ := url.Parse(proxyServer.URL)
@@ -272,6 +320,13 @@ func TestServeHTTP(t *testing.T) {
 			res, err := client.Do(req)
 			if err != nil {
 				t.Errorf("Error from proxy request: %v", err)
+			}
+
+			// Host
+			if test.useLocationHost && backendHandler.requestHost != backendURL.Host {
+				t.Errorf("Unexpected request host: %s", backendHandler.requestHost)
+			} else if !test.useLocationHost && backendHandler.requestHost == backendURL.Host {
+				t.Errorf("Unexpected request host: %s", backendHandler.requestHost)
 			}
 
 			if test.expectError != nil {
@@ -512,7 +567,7 @@ func (r *noErrorsAllowed) Error(w http.ResponseWriter, req *http.Request, err er
 	r.t.Error(err)
 }
 
-func TestProxyUpgradeErrorResponse(t *testing.T) {
+func TestProxyUpgradeConnectionErrorResponse(t *testing.T) {
 	var (
 		responder   *fakeResponder
 		expectedErr = errors.New("EXPECTED")
@@ -560,7 +615,7 @@ func TestProxyUpgradeErrorResponse(t *testing.T) {
 
 func TestProxyUpgradeErrorResponseTerminates(t *testing.T) {
 	for _, intercept := range []bool{true, false} {
-		for _, code := range []int{200, 400, 500} {
+		for _, code := range []int{400, 500} {
 			t.Run(fmt.Sprintf("intercept=%v,code=%v", intercept, code), func(t *testing.T) {
 				// Set up a backend server
 				backend := http.NewServeMux()
@@ -612,6 +667,49 @@ func TestProxyUpgradeErrorResponseTerminates(t *testing.T) {
 				req.Write(conn)
 				// wait to ensure the handler does not receive the request
 				time.Sleep(time.Second)
+
+				// clean up
+				conn.Close()
+			})
+		}
+	}
+}
+
+func TestProxyUpgradeErrorResponse(t *testing.T) {
+	for _, intercept := range []bool{true, false} {
+		for _, code := range []int{200, 300, 302, 307} {
+			t.Run(fmt.Sprintf("intercept=%v,code=%v", intercept, code), func(t *testing.T) {
+				// Set up a backend server
+				backend := http.NewServeMux()
+				backend.Handle("/hello", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+					http.Redirect(w, r, "https://example.com/there", code)
+				}))
+				backendServer := httptest.NewServer(backend)
+				defer backendServer.Close()
+				backendServerURL, _ := url.Parse(backendServer.URL)
+				backendServerURL.Path = "/hello"
+
+				// Set up a proxy pointing to a specific path on the backend
+				proxyHandler := NewUpgradeAwareHandler(backendServerURL, nil, false, false, &fakeResponder{t: t})
+				proxyHandler.InterceptRedirects = intercept
+				proxyHandler.RequireSameHostRedirects = true
+				proxy := httptest.NewServer(proxyHandler)
+				defer proxy.Close()
+				proxyURL, _ := url.Parse(proxy.URL)
+
+				conn, err := net.Dial("tcp", proxyURL.Host)
+				require.NoError(t, err)
+				bufferedReader := bufio.NewReader(conn)
+
+				// Send upgrade request resulting in a non-101 response from the backend
+				req, _ := http.NewRequest("GET", "/", nil)
+				req.Header.Set(httpstream.HeaderConnection, httpstream.HeaderUpgrade)
+				require.NoError(t, req.Write(conn))
+				// Verify we get the correct response and full message body content
+				resp, err := http.ReadResponse(bufferedReader, nil)
+				require.NoError(t, err)
+				assert.Equal(t, fakeStatusCode, resp.StatusCode)
+				resp.Body.Close()
 
 				// clean up
 				conn.Close()
@@ -716,21 +814,6 @@ func TestProxyRequestContentLengthAndTransferEncoding(t *testing.T) {
 				"Content-Length":    []string{"5"},
 				"Content-Encoding":  nil, // none set
 				"Transfer-Encoding": nil, // none set
-			},
-			expectedBody: sampleData,
-		},
-
-		"content-length + identity transfer-encoding": {
-			reqHeaders: http.Header{
-				"Content-Length":    []string{"5"},
-				"Transfer-Encoding": []string{"identity"},
-			},
-			reqBody: sampleData,
-
-			expectedHeaders: http.Header{
-				"Content-Length":    []string{"5"},
-				"Content-Encoding":  nil, // none set
-				"Transfer-Encoding": nil, // gets removed
 			},
 			expectedBody: sampleData,
 		},
@@ -901,7 +984,8 @@ func TestFlushIntervalHeaders(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	proxyHandler := NewUpgradeAwareHandler(backendURL, nil, false, false, nil)
+	responder := &fakeResponder{t: t}
+	proxyHandler := NewUpgradeAwareHandler(backendURL, nil, false, false, responder)
 
 	frontend := httptest.NewServer(proxyHandler)
 	defer frontend.Close()
@@ -921,6 +1005,53 @@ func TestFlushIntervalHeaders(t *testing.T) {
 
 	if res.Header.Get("MyHeader") != expected {
 		t.Errorf("got header %q; expected %q", res.Header.Get("MyHeader"), expected)
+	}
+}
+
+type fakeRT struct {
+	err error
+}
+
+func (frt *fakeRT) RoundTrip(*http.Request) (*http.Response, error) {
+	return nil, frt.err
+}
+
+// TestErrorPropagation checks if the default transport doesn't swallow the errors by providing a fakeResponder that intercepts and stores the error.
+func TestErrorPropagation(t *testing.T) {
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		panic("unreachable")
+	}))
+	defer backend.Close()
+
+	backendURL, err := url.Parse(backend.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	responder := &fakeResponder{t: t}
+	expectedErr := errors.New("nasty error")
+	proxyHandler := NewUpgradeAwareHandler(backendURL, &fakeRT{err: expectedErr}, true, false, responder)
+
+	frontend := httptest.NewServer(proxyHandler)
+	defer frontend.Close()
+
+	req, _ := http.NewRequest("GET", frontend.URL, nil)
+	req.Close = true
+
+	ctx, cancel := context.WithTimeout(req.Context(), 10*time.Second)
+	defer cancel()
+	req = req.WithContext(ctx)
+
+	res, err := frontend.Client().Do(req)
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	defer res.Body.Close()
+	if res.StatusCode != fakeStatusCode {
+		t.Fatalf("unexpected HTTP status code returned: %v, expected: %v", res.StatusCode, fakeStatusCode)
+	}
+	if !strings.Contains(responder.err.Error(), expectedErr.Error()) {
+		t.Fatalf("responder got unexpected error: %v, expected the error to contain %q", responder.err.Error(), expectedErr.Error())
 	}
 }
 

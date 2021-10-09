@@ -1,3 +1,4 @@
+//go:build !providerless
 // +build !providerless
 
 /*
@@ -43,7 +44,7 @@ func TestGetVolumeSpecFromGlobalMapPath(t *testing.T) {
 	// /tmp/testGlobalPathXXXXX/plugins/kubernetes.io/vsphere-volume/volumeDevices/
 	tmpVDir, err := utiltesting.MkTmpdir("vsphereBlockVolume")
 	if err != nil {
-		t.Fatalf("cant' make a temp dir: %s", err)
+		t.Fatalf("can't make a temp dir: %s", err)
 	}
 	// deferred clean up
 	defer os.RemoveAll(tmpVDir)
@@ -69,8 +70,8 @@ func TestGetVolumeSpecFromGlobalMapPath(t *testing.T) {
 	}
 	block := v1.PersistentVolumeBlock
 	specMode := spec.PersistentVolume.Spec.VolumeMode
-	if &specMode == nil {
-		t.Errorf("Invalid volumeMode from GlobalMapPath spec: %v expected: %v", &specMode, block)
+	if specMode == nil {
+		t.Errorf("Invalid volumeMode from GlobalMapPath spec: %v expected: %v", specMode, block)
 	}
 	if *specMode != block {
 		t.Errorf("Invalid volumeMode from GlobalMapPath spec: %v expected: %v", *specMode, block)
@@ -80,7 +81,7 @@ func TestGetVolumeSpecFromGlobalMapPath(t *testing.T) {
 func TestGetPodAndPluginMapPaths(t *testing.T) {
 	tmpVDir, err := utiltesting.MkTmpdir("vsphereBlockVolume")
 	if err != nil {
-		t.Fatalf("cant' make a temp dir: %s", err)
+		t.Fatalf("can't make a temp dir: %s", err)
 	}
 	// deferred clean up
 	defer os.RemoveAll(tmpVDir)

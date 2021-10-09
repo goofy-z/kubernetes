@@ -33,11 +33,19 @@ import (
 
 	authenticationv1 "k8s.io/api/authentication/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/util/wait"
 	"k8s.io/apiserver/pkg/authentication/authenticator"
 	"k8s.io/apiserver/pkg/authentication/token/cache"
 	"k8s.io/apiserver/pkg/authentication/user"
 	v1 "k8s.io/client-go/tools/clientcmd/api/v1"
 )
+
+var testRetryBackoff = wait.Backoff{
+	Duration: 5 * time.Millisecond,
+	Factor:   1.5,
+	Jitter:   0.2,
+	Steps:    5,
+}
 
 // V1Service mocks a remote authentication service.
 type V1Service interface {
@@ -170,7 +178,7 @@ func (m *mockV1Service) HTTPStatusCode() int { return m.statusCode }
 
 // newV1TokenAuthenticator creates a temporary kubeconfig file from the provided
 // arguments and attempts to load a new WebhookTokenAuthenticator from it.
-func newV1TokenAuthenticator(serverURL string, clientCert, clientKey, ca []byte, cacheTime time.Duration, implicitAuds authenticator.Audiences) (authenticator.Token, error) {
+func newV1TokenAuthenticator(serverURL string, clientCert, clientKey, ca []byte, cacheTime time.Duration, implicitAuds authenticator.Audiences, metrics AuthenticatorMetrics) (authenticator.Token, error) {
 	tempfile, err := ioutil.TempFile("", "")
 	if err != nil {
 		return nil, err
@@ -193,12 +201,12 @@ func newV1TokenAuthenticator(serverURL string, clientCert, clientKey, ca []byte,
 		return nil, err
 	}
 
-	c, err := tokenReviewInterfaceFromKubeconfig(p, "v1", nil)
+	c, err := tokenReviewInterfaceFromKubeconfig(p, "v1", testRetryBackoff, nil)
 	if err != nil {
 		return nil, err
 	}
 
-	authn, err := newWithBackoff(c, 0, implicitAuds)
+	authn, err := newWithBackoff(c, testRetryBackoff, implicitAuds, 10*time.Second, metrics)
 	if err != nil {
 		return nil, err
 	}
@@ -259,7 +267,7 @@ func TestV1TLSConfig(t *testing.T) {
 			}
 			defer server.Close()
 
-			wh, err := newV1TokenAuthenticator(server.URL, tt.clientCert, tt.clientKey, tt.clientCA, 0, nil)
+			wh, err := newV1TokenAuthenticator(server.URL, tt.clientCert, tt.clientKey, tt.clientCA, 0, nil, noopAuthenticatorMetrics())
 			if err != nil {
 				t.Errorf("%s: failed to create client: %v", tt.test, err)
 				return
@@ -482,7 +490,7 @@ func TestV1WebhookTokenAuthenticator(t *testing.T) {
 	token := "my-s3cr3t-t0ken" // Fake token for testing.
 	for _, tt := range tests {
 		t.Run(tt.description, func(t *testing.T) {
-			wh, err := newV1TokenAuthenticator(s.URL, clientCert, clientKey, caCert, 0, tt.implicitAuds)
+			wh, err := newV1TokenAuthenticator(s.URL, clientCert, clientKey, caCert, 0, tt.implicitAuds, noopAuthenticatorMetrics())
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -555,7 +563,7 @@ func TestV1WebhookCacheAndRetry(t *testing.T) {
 	defer s.Close()
 
 	// Create an authenticator that caches successful responses "forever" (100 days).
-	wh, err := newV1TokenAuthenticator(s.URL, clientCert, clientKey, caCert, 2400*time.Hour, nil)
+	wh, err := newV1TokenAuthenticator(s.URL, clientCert, clientKey, caCert, 2400*time.Hour, nil, noopAuthenticatorMetrics())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -680,5 +688,12 @@ func TestV1WebhookCacheAndRetry(t *testing.T) {
 				t.Errorf("Expected ok=%v, got %v", testcase.expectOk, ok)
 			}
 		})
+	}
+}
+
+func noopAuthenticatorMetrics() AuthenticatorMetrics {
+	return AuthenticatorMetrics{
+		RecordRequestTotal:   noopMetrics{}.RequestTotal,
+		RecordRequestLatency: noopMetrics{}.RequestLatency,
 	}
 }

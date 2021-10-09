@@ -1,3 +1,4 @@
+//go:build !providerless
 // +build !providerless
 
 /*
@@ -36,7 +37,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/tools/record"
-	"k8s.io/cloud-provider"
+	cloudprovider "k8s.io/cloud-provider"
 	servicehelper "k8s.io/cloud-provider/service/helpers"
 )
 
@@ -328,7 +329,7 @@ func TestEnsureInternalLoadBalancerClearPreviousResources(t *testing.T) {
 	}
 
 	gce.CreateRegionBackendService(existingBS, gce.region)
-	existingFwdRule.BackendService = existingBS.Name
+	existingFwdRule.BackendService = cloud.SelfLink(meta.VersionGA, vals.ProjectID, "backendServices", meta.RegionalKey(existingBS.Name, gce.region))
 
 	_, err = createInternalLoadBalancer(gce, svc, existingFwdRule, []string{"test-node-1"}, vals.ClusterName, vals.ClusterID, vals.ZoneName)
 	assert.NoError(t, err)
@@ -682,11 +683,11 @@ func TestEnsureInternalFirewallDeletesLegacyFirewall(t *testing.T) {
 	}
 
 	existingFirewall, err := gce.GetFirewall(fwName)
-	require.Nil(t, err)
+	require.NoError(t, err)
 	require.NotNil(t, existingFirewall)
 	// Existing firewall will not be deleted yet since this was the first sync with the new rule created.
 	existingLegacyFirewall, err := gce.GetFirewall(lbName)
-	require.Nil(t, err)
+	require.NoError(t, err)
 	require.NotNil(t, existingLegacyFirewall)
 
 	// Now ensure the firewall again to simulate a second sync where the old rule will be deleted.
@@ -704,10 +705,10 @@ func TestEnsureInternalFirewallDeletesLegacyFirewall(t *testing.T) {
 	}
 
 	existingFirewall, err = gce.GetFirewall(fwName)
-	require.Nil(t, err)
+	require.NoError(t, err)
 	require.NotNil(t, existingFirewall)
 	existingLegacyFirewall, err = gce.GetFirewall(lbName)
-	require.NotNil(t, err)
+	require.Error(t, err)
 	require.Nil(t, existingLegacyFirewall)
 
 }
@@ -761,9 +762,9 @@ func TestEnsureInternalFirewallSucceedsOnXPN(t *testing.T) {
 		v1.ProtocolTCP,
 		nodes,
 		lbName)
-	require.Nil(t, err)
+	require.NoError(t, err)
 	existingFirewall, err := gce.GetFirewall(fwName)
-	require.Nil(t, err)
+	require.NoError(t, err)
 	require.NotNil(t, existingFirewall)
 
 	gce.onXPN = true
@@ -949,6 +950,11 @@ func TestEnsureInternalLoadBalancerErrors(t *testing.T) {
 			)
 			assert.Error(t, err, "Should return an error when "+desc)
 			assert.Nil(t, status, "Should not return a status when "+desc)
+
+			// ensure that the temporarily reserved IP address is released upon sync errors
+			ip, err := gce.GetRegionAddress(gce.GetLoadBalancerName(context.TODO(), params.clusterName, params.service), gce.region)
+			require.Error(t, err)
+			assert.Nil(t, ip)
 		})
 	}
 }
@@ -1038,39 +1044,67 @@ func TestCompareHealthChecks(t *testing.T) {
 // Test creation of InternalLoadBalancer with ILB Subsets featuregate enabled.
 func TestEnsureInternalLoadBalancerSubsetting(t *testing.T) {
 	t.Parallel()
+	for _, tc := range []struct {
+		desc                 string
+		finalizers           []string
+		createForwardingRule bool
+		expectErrorMsg       string
+	}{
+		{desc: "New service creation fails with Implemented Elsewhere", expectErrorMsg: cloudprovider.ImplementedElsewhere.Error()},
+		{desc: "Service with existing ForwardingRule is processed", createForwardingRule: true},
+		{desc: "Service with v1 finalizer is processed", finalizers: []string{ILBFinalizerV1}},
+		{desc: "Service with v2 finalizer is skipped", finalizers: []string{ILBFinalizerV2}, expectErrorMsg: cloudprovider.ImplementedElsewhere.Error()},
+		{desc: "Service with v2 finalizer and existing ForwardingRule is processed", finalizers: []string{ILBFinalizerV2}, createForwardingRule: true},
+		{desc: "Service with v1 and v2 finalizers is processed", finalizers: []string{ILBFinalizerV1, ILBFinalizerV2}},
+	} {
+		t.Run(tc.desc, func(t *testing.T) {
+			vals := DefaultTestClusterValues()
+			gce, err := fakeGCECloud(vals)
+			require.NoError(t, err)
+			gce.AlphaFeatureGate = NewAlphaFeatureGate([]string{AlphaFeatureILBSubsets})
+			recorder := record.NewFakeRecorder(1024)
+			gce.eventRecorder = recorder
 
-	vals := DefaultTestClusterValues()
-	gce, err := fakeGCECloud(vals)
-	require.NoError(t, err)
-	gce.AlphaFeatureGate = NewAlphaFeatureGate([]string{AlphaFeatureILBSubsets})
-	recorder := record.NewFakeRecorder(1024)
-	gce.eventRecorder = recorder
-
-	nodeNames := []string{"test-node-1"}
-	nodes, err := createAndInsertNodes(gce, nodeNames, vals.ZoneName)
-	require.NoError(t, err)
-
-	svc := fakeLoadbalancerService(string(LBTypeInternal))
-	svc, err = gce.client.CoreV1().Services(svc.Namespace).Create(context.TODO(), svc, metav1.CreateOptions{})
-	require.NoError(t, err)
-	status, err := createInternalLoadBalancer(gce, svc, nil, nodeNames, vals.ClusterName, vals.ClusterID, vals.ZoneName)
-	assert.EqualError(t, err, cloudprovider.ImplementedElsewhere.Error())
-	expectedEvent := fmt.Sprintf("Normal SkippingEnsureInternalLoadBalancer Skipped ensureInternalLoadBalancer"+
-		" since %s feature is enabled.", AlphaFeatureILBSubsets)
-	checkEvent(t, recorder, expectedEvent, true)
-	// No loadbalancer resources will be created due to the ILB Feature Gate
-	assert.Empty(t, status)
-	assertInternalLbResourcesDeleted(t, gce, svc, vals, true)
-	// Invoking delete should be a no-op
-	err = gce.EnsureLoadBalancerDeleted(context.Background(), vals.ClusterName, svc)
-	assert.NoError(t, err)
-	assertInternalLbResourcesDeleted(t, gce, svc, vals, true)
-	// Now remove the feature gate so that lb resources are created
-	gce.AlphaFeatureGate = NewAlphaFeatureGate([]string{})
-	status, err = gce.EnsureLoadBalancer(context.Background(), vals.ClusterName, svc, nodes)
-	assert.NoError(t, err)
-	assert.NotEmpty(t, status.Ingress)
-	assertInternalLbResources(t, gce, svc, vals, nodeNames)
+			nodeNames := []string{"test-node-1"}
+			_, err = createAndInsertNodes(gce, nodeNames, vals.ZoneName)
+			require.NoError(t, err)
+			svc := fakeLoadbalancerService(string(LBTypeInternal))
+			svc.Finalizers = tc.finalizers
+			svc, err = gce.client.CoreV1().Services(svc.Namespace).Create(context.TODO(), svc, metav1.CreateOptions{})
+			require.NoError(t, err)
+			var existingFwdRule *compute.ForwardingRule
+			if tc.createForwardingRule {
+				// Create a ForwardingRule with the expected name
+				existingFwdRule = &compute.ForwardingRule{
+					Name:                gce.GetLoadBalancerName(context.TODO(), "", svc),
+					IPAddress:           "5.6.7.8",
+					Ports:               []string{"123"},
+					IPProtocol:          "TCP",
+					LoadBalancingScheme: string(cloud.SchemeInternal),
+				}
+				gce.CreateRegionForwardingRule(existingFwdRule, gce.region)
+			}
+			gotErrorMsg := ""
+			status, err := createInternalLoadBalancer(gce, svc, existingFwdRule, nodeNames, vals.ClusterName, vals.ClusterID, vals.ZoneName)
+			if err != nil {
+				gotErrorMsg = err.Error()
+			}
+			if gotErrorMsg != tc.expectErrorMsg {
+				t.Errorf("createInternalLoadBalancer() = %q, want error %q", err, tc.expectErrorMsg)
+			}
+			if err != nil {
+				assert.Empty(t, status)
+				assertInternalLbResourcesDeleted(t, gce, svc, vals, true)
+			} else {
+				assert.NotEmpty(t, status.Ingress)
+				assertInternalLbResources(t, gce, svc, vals, nodeNames)
+			}
+			// Ensure that cleanup is successful, if applicable.
+			err = gce.EnsureLoadBalancerDeleted(context.Background(), vals.ClusterName, svc)
+			assert.NoError(t, err)
+			assertInternalLbResourcesDeleted(t, gce, svc, vals, true)
+		})
+	}
 }
 
 // TestEnsureInternalLoadBalancerDeletedSubsetting verifies that updates and deletion of existing ILB resources
@@ -1100,6 +1134,60 @@ func TestEnsureInternalLoadBalancerDeletedSubsetting(t *testing.T) {
 	assert.NoError(t, err)
 	// ensure that the status has the new IP
 	assert.Equal(t, status.Ingress[0].IP, "1.2.3.4")
+	// Invoked when service is deleted.
+	err = gce.EnsureLoadBalancerDeleted(context.Background(), vals.ClusterName, svc)
+	assert.NoError(t, err)
+	assertInternalLbResourcesDeleted(t, gce, svc, vals, true)
+}
+
+// TestEnsureInternalLoadBalancerUpdateSubsetting verifies that updates of existing ILB instance groups
+// continue to work, even if ILBSubsets feature is enabled.
+func TestEnsureInternalLoadBalancerUpdateSubsetting(t *testing.T) {
+	t.Parallel()
+
+	vals := DefaultTestClusterValues()
+	gce, err := fakeGCECloud(vals)
+	assert.NoError(t, err)
+	recorder := record.NewFakeRecorder(1024)
+	gce.eventRecorder = recorder
+
+	nodeNames := []string{"test-node-1"}
+	svc := fakeLoadbalancerService(string(LBTypeInternal))
+	svc, err = gce.client.CoreV1().Services(svc.Namespace).Create(context.TODO(), svc, metav1.CreateOptions{})
+	assert.NoError(t, err)
+	status, err := createInternalLoadBalancer(gce, svc, nil, nodeNames, vals.ClusterName, vals.ClusterID, vals.ZoneName)
+
+	assert.NoError(t, err)
+	assert.NotEmpty(t, status.Ingress)
+	svc, err = gce.client.CoreV1().Services(svc.Namespace).Get(context.TODO(), svc.Name, metav1.GetOptions{})
+	assert.NoError(t, err)
+	if !hasFinalizer(svc, ILBFinalizerV1) {
+		t.Errorf("Expected finalizer '%s' not found in Finalizer list - %v", ILBFinalizerV1, svc.Finalizers)
+	}
+	// Enable FeatureGate after service has been created.
+	gce.AlphaFeatureGate = NewAlphaFeatureGate([]string{AlphaFeatureILBSubsets})
+	// mock scenario where user adds more nodes, this should be updated in the ILB.
+	nodeNames = []string{"test-node-1", "test-node-2"}
+	nodes, err := createAndInsertNodes(gce, nodeNames, vals.ZoneName)
+	assert.NoError(t, err)
+	err = gce.UpdateLoadBalancer(context.Background(), vals.ClusterName, svc, nodes)
+	assert.NoError(t, err)
+	// Ensure that the backend service/Instance group has both nodes.
+	igName := makeInstanceGroupName(vals.ClusterID)
+	instances, err := gce.ListInstancesInInstanceGroup(igName, vals.ZoneName, allInstances)
+	assert.NoError(t, err)
+	var instanceNames []string
+	for _, inst := range instances {
+		resourceID, err := cloud.ParseResourceURL(inst.Instance)
+		if err != nil || resourceID == nil || resourceID.Key == nil {
+			t.Errorf("Failed to parse instance url - %q, error - %v", inst.Instance, err)
+			continue
+		}
+		instanceNames = append(instanceNames, resourceID.Key.Name)
+	}
+	if !equalStringSets(instanceNames, nodeNames) {
+		t.Errorf("Got instances - %v, want %v", instanceNames, nodeNames)
+	}
 	// Invoked when service is deleted.
 	err = gce.EnsureLoadBalancerDeleted(context.Background(), vals.ClusterName, svc)
 	assert.NoError(t, err)
@@ -1310,6 +1398,7 @@ func TestForwardingRulesEqual(t *testing.T) {
 			Ports:               []string{"123"},
 			IPProtocol:          "TCP",
 			LoadBalancingScheme: string(cloud.SchemeInternal),
+			BackendService:      "http://www.googleapis.com/projects/test/regions/us-central1/backendServices/bs1",
 		},
 		{
 			Name:                "tcp-fwd-rule",
@@ -1317,6 +1406,7 @@ func TestForwardingRulesEqual(t *testing.T) {
 			Ports:               []string{"123"},
 			IPProtocol:          "TCP",
 			LoadBalancingScheme: string(cloud.SchemeInternal),
+			BackendService:      "http://www.googleapis.com/projects/test/regions/us-central1/backendServices/bs1",
 		},
 		{
 			Name:                "udp-fwd-rule",
@@ -1324,6 +1414,7 @@ func TestForwardingRulesEqual(t *testing.T) {
 			Ports:               []string{"123"},
 			IPProtocol:          "UDP",
 			LoadBalancingScheme: string(cloud.SchemeInternal),
+			BackendService:      "http://www.googleapis.com/projects/test/regions/us-central1/backendServices/bs1",
 		},
 		{
 			Name:                "global-access-fwd-rule",
@@ -1332,6 +1423,25 @@ func TestForwardingRulesEqual(t *testing.T) {
 			IPProtocol:          "TCP",
 			LoadBalancingScheme: string(cloud.SchemeInternal),
 			AllowGlobalAccess:   true,
+			BackendService:      "http://www.googleapis.com/projects/test/regions/us-central1/backendServices/bs1",
+		},
+		{
+			Name:                "global-access-fwd-rule",
+			IPAddress:           "10.0.0.0",
+			Ports:               []string{"123"},
+			IPProtocol:          "TCP",
+			LoadBalancingScheme: string(cloud.SchemeInternal),
+			AllowGlobalAccess:   true,
+			BackendService:      "http://compute.googleapis.com/projects/test/regions/us-central1/backendServices/bs1",
+		},
+		{
+			Name:                "udp-fwd-rule-allports",
+			IPAddress:           "10.0.0.0",
+			Ports:               []string{"123"},
+			AllPorts:            true,
+			IPProtocol:          "UDP",
+			LoadBalancingScheme: string(cloud.SchemeInternal),
+			BackendService:      "http://www.googleapis.com/projects/test/regions/us-central1/backendServices/bs1",
 		},
 	}
 
@@ -1365,6 +1475,18 @@ func TestForwardingRulesEqual(t *testing.T) {
 			newFwdRule: fwdRules[3],
 			expect:     true,
 		},
+		{
+			desc:       "same forwarding rule, different basepath",
+			oldFwdRule: fwdRules[3],
+			newFwdRule: fwdRules[4],
+			expect:     true,
+		},
+		{
+			desc:       "same forwarding rule, one uses AllPorts",
+			oldFwdRule: fwdRules[2],
+			newFwdRule: fwdRules[5],
+			expect:     false,
+		},
 	} {
 		t.Run(tc.desc, func(t *testing.T) {
 			got := forwardingRulesEqual(tc.oldFwdRule, tc.newFwdRule)
@@ -1381,7 +1503,6 @@ func TestEnsureInternalLoadBalancerCustomSubnet(t *testing.T) {
 	vals := DefaultTestClusterValues()
 	gce, err := fakeGCECloud(vals)
 	require.NoError(t, err)
-	gce.AlphaFeatureGate = NewAlphaFeatureGate([]string{AlphaFeatureILBCustomSubnet})
 
 	nodeNames := []string{"test-node-1"}
 	nodes, err := createAndInsertNodes(gce, nodeNames, vals.ZoneName)
@@ -1572,8 +1693,6 @@ func TestEnsureLoadBalancerSkipped(t *testing.T) {
 	vals := DefaultTestClusterValues()
 	gce, err := fakeGCECloud(vals)
 	require.NoError(t, err)
-	recorder := record.NewFakeRecorder(1024)
-	gce.eventRecorder = recorder
 
 	nodeNames := []string{"test-node-1"}
 	svc := fakeLoadbalancerService(string(LBTypeInternal))
@@ -1583,10 +1702,6 @@ func TestEnsureLoadBalancerSkipped(t *testing.T) {
 	require.NoError(t, err)
 	status, err := createInternalLoadBalancer(gce, svc, nil, nodeNames, vals.ClusterName, vals.ClusterID, vals.ZoneName)
 	assert.EqualError(t, err, cloudprovider.ImplementedElsewhere.Error())
-	expectedEvent := fmt.Sprintf("Normal SkippingEnsureInternalLoadBalancer Skipped ensureInternalLoadBalancer"+
-		" as service contains '%s' finalizer",
-		ILBFinalizerV2)
-	checkEvent(t, recorder, expectedEvent, true)
 	// No loadbalancer resources will be created due to the ILB Feature Gate
 	assert.Empty(t, status)
 	assertInternalLbResourcesDeleted(t, gce, svc, vals, true)
@@ -1637,4 +1752,148 @@ func TestEnsureLoadBalancerPartialDelete(t *testing.T) {
 	_, exists, err = gce.GetLoadBalancer(context.TODO(), vals.ClusterName, svc)
 	require.NoError(t, err)
 	assert.False(t, exists)
+}
+
+func TestEnsureInternalLoadBalancerModifyProtocol(t *testing.T) {
+	t.Parallel()
+
+	vals := DefaultTestClusterValues()
+	gce, err := fakeGCECloud(vals)
+	require.NoError(t, err)
+	c := gce.c.(*cloud.MockGCE)
+	c.MockRegionBackendServices.UpdateHook = func(ctx context.Context, key *meta.Key, be *compute.BackendService, m *cloud.MockRegionBackendServices) error {
+		// Same key can be used since FR will have the same name.
+		fr, err := c.MockForwardingRules.Get(ctx, key)
+		if err != nil && !isNotFound(err) {
+			return err
+		}
+		if fr != nil && fr.IPProtocol != be.Protocol {
+			return fmt.Errorf("Protocol mismatch between Forwarding Rule value %q and Backend service value %q", fr.IPProtocol, be.Protocol)
+		}
+		return mock.UpdateRegionBackendServiceHook(ctx, key, be, m)
+	}
+	nodeNames := []string{"test-node-1"}
+	nodes, err := createAndInsertNodes(gce, nodeNames, vals.ZoneName)
+	require.NoError(t, err)
+	svc := fakeLoadbalancerService(string(LBTypeInternal))
+	svc, err = gce.client.CoreV1().Services(svc.Namespace).Create(context.TODO(), svc, metav1.CreateOptions{})
+	require.NoError(t, err)
+	lbName := gce.GetLoadBalancerName(context.TODO(), "", svc)
+	status, err := createInternalLoadBalancer(gce, svc, nil, nodeNames, vals.ClusterName, vals.ClusterID, vals.ZoneName)
+	if err != nil {
+		t.Errorf("Unexpected error %v", err)
+	}
+	assert.NotEmpty(t, status.Ingress)
+	fwdRule, err := gce.GetRegionForwardingRule(lbName, gce.region)
+	if err != nil {
+		t.Errorf("gce.GetRegionForwardingRule(%q, %q) = %v, want nil", lbName, gce.region, err)
+	}
+	if fwdRule.IPProtocol != "TCP" {
+		t.Errorf("Unexpected protocol value %s, expected TCP", fwdRule.IPProtocol)
+	}
+
+	// change the protocol to UDP
+	svc.Spec.Ports[0].Protocol = v1.ProtocolUDP
+	status, err = gce.EnsureLoadBalancer(context.Background(), vals.ClusterName, svc, nodes)
+	if err != nil {
+		t.Errorf("Unexpected error %v", err)
+	}
+	assert.NotEmpty(t, status.Ingress)
+	fwdRule, err = gce.GetRegionForwardingRule(lbName, gce.region)
+	if err != nil {
+		t.Errorf("gce.GetRegionForwardingRule(%q, %q) = %v, want nil", lbName, gce.region, err)
+	}
+	if fwdRule.IPProtocol != "UDP" {
+		t.Errorf("Unexpected protocol value %s, expected UDP", fwdRule.IPProtocol)
+	}
+
+	// Delete the service
+	err = gce.EnsureLoadBalancerDeleted(context.Background(), vals.ClusterName, svc)
+	if err != nil {
+		t.Errorf("Unexpected error %v", err)
+	}
+	assertInternalLbResourcesDeleted(t, gce, svc, vals, true)
+}
+
+func TestEnsureInternalLoadBalancerAllPorts(t *testing.T) {
+	t.Parallel()
+
+	vals := DefaultTestClusterValues()
+	gce, err := fakeGCECloud(vals)
+	require.NoError(t, err)
+	nodeNames := []string{"test-node-1"}
+	nodes, err := createAndInsertNodes(gce, nodeNames, vals.ZoneName)
+	require.NoError(t, err)
+	svc := fakeLoadbalancerService(string(LBTypeInternal))
+	svc, err = gce.client.CoreV1().Services(svc.Namespace).Create(context.TODO(), svc, metav1.CreateOptions{})
+	require.NoError(t, err)
+	lbName := gce.GetLoadBalancerName(context.TODO(), "", svc)
+	status, err := createInternalLoadBalancer(gce, svc, nil, nodeNames, vals.ClusterName, vals.ClusterID, vals.ZoneName)
+	if err != nil {
+		t.Errorf("Unexpected error %v", err)
+	}
+	assert.NotEmpty(t, status.Ingress)
+	fwdRule, err := gce.GetRegionForwardingRule(lbName, gce.region)
+	if err != nil {
+		t.Errorf("gce.GetRegionForwardingRule(%q, %q) = %v, want nil", lbName, gce.region, err)
+	}
+	if fwdRule.Ports[0] != "123" {
+		t.Errorf("Unexpected port value %v, expected [123]", fwdRule.Ports)
+	}
+
+	// Change service spec to use more than 5 ports
+	svc.Spec.Ports = []v1.ServicePort{
+		{Name: "testport", Port: int32(8080), Protocol: "TCP"},
+		{Name: "testport", Port: int32(8090), Protocol: "TCP"},
+		{Name: "testport", Port: int32(8100), Protocol: "TCP"},
+		{Name: "testport", Port: int32(8200), Protocol: "TCP"},
+		{Name: "testport", Port: int32(8300), Protocol: "TCP"},
+		{Name: "testport", Port: int32(8400), Protocol: "TCP"},
+	}
+	status, err = gce.EnsureLoadBalancer(context.Background(), vals.ClusterName, svc, nodes)
+	if err != nil {
+		t.Errorf("Unexpected error %v", err)
+	}
+	assert.NotEmpty(t, status.Ingress)
+	fwdRule, err = gce.GetRegionForwardingRule(lbName, gce.region)
+	if err != nil {
+		t.Errorf("gce.GetRegionForwardingRule(%q, %q) = %v, want nil", lbName, gce.region, err)
+	}
+	if !fwdRule.AllPorts {
+		t.Errorf("Unexpected AllPorts false value, expected true, FR - %v", fwdRule)
+	}
+	if len(fwdRule.Ports) != 0 {
+		t.Errorf("Unexpected port value %v, expected empty list", fwdRule.Ports)
+	}
+
+	// Change service spec back to use < 5 ports
+	svc.Spec.Ports = []v1.ServicePort{
+		{Name: "testport", Port: int32(8090), Protocol: "TCP"},
+		{Name: "testport", Port: int32(8100), Protocol: "TCP"},
+		{Name: "testport", Port: int32(8300), Protocol: "TCP"},
+		{Name: "testport", Port: int32(8400), Protocol: "TCP"},
+	}
+	expectPorts := []string{"8090", "8100", "8300", "8400"}
+	status, err = gce.EnsureLoadBalancer(context.Background(), vals.ClusterName, svc, nodes)
+	if err != nil {
+		t.Errorf("Unexpected error %v", err)
+	}
+	assert.NotEmpty(t, status.Ingress)
+	fwdRule, err = gce.GetRegionForwardingRule(lbName, gce.region)
+	if err != nil {
+		t.Errorf("gce.GetRegionForwardingRule(%q, %q) = %v, want nil", lbName, gce.region, err)
+	}
+	if fwdRule.AllPorts {
+		t.Errorf("Unexpected AllPorts true value, expected false, FR - %v", fwdRule)
+	}
+	if !equalStringSets(fwdRule.Ports, expectPorts) {
+		t.Errorf("Unexpected port value %v, expected %v", fwdRule.Ports, expectPorts)
+	}
+
+	// Delete the service
+	err = gce.EnsureLoadBalancerDeleted(context.Background(), vals.ClusterName, svc)
+	if err != nil {
+		t.Errorf("Unexpected error %v", err)
+	}
+	assertInternalLbResourcesDeleted(t, gce, svc, vals, true)
 }

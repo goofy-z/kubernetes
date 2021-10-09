@@ -1,3 +1,6 @@
+//go:build !providerless
+// +build !providerless
+
 /*
 Copyright 2018 The Kubernetes Authors.
 
@@ -23,7 +26,7 @@ import (
 	"strings"
 	"testing"
 
-	"k8s.io/api/core/v1"
+	v1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/informers"
 	"k8s.io/client-go/kubernetes/fake"
@@ -87,8 +90,8 @@ func TestNewNodeIpamControllerWithCIDRMasks(t *testing.T) {
 	} {
 		t.Run(tc.desc, func(t *testing.T) {
 			clusterCidrs, _ := netutils.ParseCIDRs(strings.Split(tc.clusterCIDR, ","))
-			_, serviceCIDRIpNet, _ := net.ParseCIDR(tc.serviceCIDR)
-			_, secondaryServiceCIDRIpNet, _ := net.ParseCIDR(tc.secondaryServiceCIDR)
+			_, serviceCIDRIpNet, _ := netutils.ParseCIDRSloppy(tc.serviceCIDR)
+			_, secondaryServiceCIDRIpNet, _ := netutils.ParseCIDRSloppy(tc.secondaryServiceCIDR)
 
 			if os.Getenv("EXIT_ON_FATAL") == "1" {
 				// This is the subprocess which runs the actual code.

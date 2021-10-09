@@ -25,21 +25,25 @@ import (
 	"io/ioutil"
 	"net/http"
 	"net/http/httptest"
+	"path"
 	"sort"
 	"strings"
 	"sync"
 	"testing"
 	"time"
 
+	clientv3 "go.etcd.io/etcd/client/v3"
 	admissionreviewv1 "k8s.io/api/admission/v1"
 	"k8s.io/api/admission/v1beta1"
+	admissionregistrationv1 "k8s.io/api/admissionregistration/v1"
 	admissionv1 "k8s.io/api/admissionregistration/v1"
 	admissionv1beta1 "k8s.io/api/admissionregistration/v1beta1"
 	appsv1beta1 "k8s.io/api/apps/v1beta1"
+	authenticationv1 "k8s.io/api/authentication/v1"
 	corev1 "k8s.io/api/core/v1"
 	v1 "k8s.io/api/core/v1"
 	extensionsv1beta1 "k8s.io/api/extensions/v1beta1"
-	policyv1beta1 "k8s.io/api/policy/v1beta1"
+	policyv1 "k8s.io/api/policy/v1"
 	apiextensionsclientset "k8s.io/apiextensions-apiserver/pkg/client/clientset/clientset"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -49,11 +53,13 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/sets"
 	"k8s.io/apimachinery/pkg/util/wait"
+	genericapirequest "k8s.io/apiserver/pkg/endpoints/request"
 	dynamic "k8s.io/client-go/dynamic"
 	clientset "k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
 	"k8s.io/client-go/util/retry"
 	kubeapiservertesting "k8s.io/kubernetes/cmd/kube-apiserver/app/testing"
+	apisv1beta1 "k8s.io/kubernetes/pkg/apis/admissionregistration/v1beta1"
 	"k8s.io/kubernetes/test/integration/etcd"
 	"k8s.io/kubernetes/test/integration/framework"
 )
@@ -64,6 +70,10 @@ const (
 
 	mutation   = "mutation"
 	validation = "validation"
+)
+
+var (
+	noSideEffects = admissionregistrationv1.SideEffectClassNone
 )
 
 type testContext struct {
@@ -118,6 +128,8 @@ var (
 		gvr("", "v1", "pods/proxy"):     {"*": testSubresourceProxy},
 		gvr("", "v1", "services/proxy"): {"*": testSubresourceProxy},
 
+		gvr("", "v1", "serviceaccounts/token"): {"create": testTokenCreate},
+
 		gvr("random.numbers.com", "v1", "integers"): {"create": testPruningRandomNumbers},
 		gvr("custom.fancy.com", "v2", "pants"):      {"create": testNoPruningCustomFancy},
 	}
@@ -169,6 +181,8 @@ type holder struct {
 
 	t *testing.T
 
+	warningHandler *warningHandler
+
 	recordGVR       metav1.GroupVersionResource
 	recordOperation string
 	recordNamespace string
@@ -203,6 +217,7 @@ func (h *holder) reset(t *testing.T) {
 	h.expectOldObject = false
 	h.expectOptionsGVK = schema.GroupVersionKind{}
 	h.expectOptions = false
+	h.warningHandler.reset()
 
 	// Set up the recorded map with nil records for all combinations
 	h.recorded = map[webhookOptions]*admissionRequest{}
@@ -215,8 +230,8 @@ func (h *holder) reset(t *testing.T) {
 	}
 }
 func (h *holder) expect(gvr schema.GroupVersionResource, gvk, optionsGVK schema.GroupVersionKind, operation v1beta1.Operation, name, namespace string, object, oldObject, options bool) {
-	// Special-case namespaces, since the object name shows up in request attributes for update/delete requests
-	if len(namespace) == 0 && gvk.Group == "" && gvk.Version == "v1" && gvk.Kind == "Namespace" && operation != v1beta1.Create {
+	// Special-case namespaces, since the object name shows up in request attributes
+	if len(namespace) == 0 && gvk.Group == "" && gvk.Version == "v1" && gvk.Kind == "Namespace" {
 		namespace = name
 	}
 
@@ -231,6 +246,7 @@ func (h *holder) expect(gvr schema.GroupVersionResource, gvk, optionsGVK schema.
 	h.expectOldObject = oldObject
 	h.expectOptionsGVK = optionsGVK
 	h.expectOptions = options
+	h.warningHandler.reset()
 
 	// Set up the recorded map with nil records for all combinations
 	h.recorded = map[webhookOptions]*admissionRequest{}
@@ -314,13 +330,15 @@ func (h *holder) verify(t *testing.T) {
 	defer h.lock.Unlock()
 
 	for options, value := range h.recorded {
-		if err := h.verifyRequest(options.converted, value); err != nil {
+		if err := h.verifyRequest(options, value); err != nil {
 			t.Errorf("version: %v, phase:%v, converted:%v error: %v", options.version, options.phase, options.converted, err)
 		}
 	}
 }
 
-func (h *holder) verifyRequest(converted bool, request *admissionRequest) error {
+func (h *holder) verifyRequest(webhookOptions webhookOptions, request *admissionRequest) error {
+	converted := webhookOptions.converted
+
 	// Check if current resource should be exempted from Admission processing
 	if admissionExemptResources[gvr(h.recordGVR.Group, h.recordGVR.Version, h.recordGVR.Resource)] {
 		if request == nil {
@@ -357,6 +375,10 @@ func (h *holder) verifyRequest(converted bool, request *admissionRequest) error 
 		return fmt.Errorf("unexpected options: %#v", request.Options.Object)
 	}
 
+	if !h.warningHandler.hasWarning(makeWarning(webhookOptions.version, webhookOptions.phase, webhookOptions.converted)) {
+		return fmt.Errorf("no warning received from webhook")
+	}
+
 	return nil
 }
 
@@ -384,6 +406,34 @@ func (h *holder) verifyOptions(options runtime.Object) error {
 	return nil
 }
 
+type warningHandler struct {
+	lock     sync.Mutex
+	warnings map[string]bool
+}
+
+func (w *warningHandler) reset() {
+	w.lock.Lock()
+	defer w.lock.Unlock()
+	w.warnings = map[string]bool{}
+}
+func (w *warningHandler) hasWarning(warning string) bool {
+	w.lock.Lock()
+	defer w.lock.Unlock()
+	return w.warnings[warning]
+}
+func makeWarning(version string, phase string, converted bool) string {
+	return fmt.Sprintf("%v/%v/%v", version, phase, converted)
+}
+
+func (w *warningHandler) HandleWarningHeader(code int, agent string, message string) {
+	if code != 299 || len(message) == 0 {
+		return
+	}
+	w.lock.Lock()
+	defer w.lock.Unlock()
+	w.warnings[message] = true
+}
+
 // TestWebhookAdmissionWithWatchCache tests communication between API server and webhook process.
 func TestWebhookAdmissionWithWatchCache(t *testing.T) {
 	testWebhookAdmission(t, true)
@@ -399,6 +449,7 @@ func testWebhookAdmission(t *testing.T, watchCache bool) {
 	// holder communicates expectations to webhooks, and results from webhooks
 	holder := &holder{
 		t:                 t,
+		warningHandler:    &warningHandler{warnings: map[string]bool{}},
 		gvrToConvertedGVR: map[metav1.GroupVersionResource]metav1.GroupVersionResource{},
 		gvrToConvertedGVK: map[metav1.GroupVersionResource]schema.GroupVersionKind{},
 	}
@@ -441,6 +492,8 @@ func testWebhookAdmission(t *testing.T, watchCache bool) {
 		"--disable-admission-plugins=ServiceAccount,StorageObjectInUseProtection",
 		// force enable all resources so we can check storage.
 		"--runtime-config=api/all=true",
+		// enable feature-gates that protect resources to check their storage, too.
+		"--feature-gates=EphemeralContainers=true",
 	}, etcdConfig)
 	defer server.TearDownFn()
 
@@ -451,6 +504,7 @@ func testWebhookAdmission(t *testing.T, watchCache bool) {
 	clientConfig := rest.CopyConfig(server.ClientConfig)
 	clientConfig.Impersonate.UserName = testClientUsername
 	clientConfig.Impersonate.Groups = []string{"system:masters", "system:authenticated"}
+	clientConfig.WarningHandler = holder.warningHandler
 	client, err := clientset.NewForConfig(clientConfig)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
@@ -550,10 +604,10 @@ func testWebhookAdmission(t *testing.T, watchCache bool) {
 		holder.gvrToConvertedGVK[metaGVR] = schema.GroupVersionKind{Group: resourcesByGVR[convertedGVR].Group, Version: resourcesByGVR[convertedGVR].Version, Kind: resourcesByGVR[convertedGVR].Kind}
 	}
 
-	if err := createV1beta1MutationWebhook(client, webhookServer.URL+"/v1beta1/"+mutation, webhookServer.URL+"/v1beta1/convert/"+mutation, convertedV1beta1Rules); err != nil {
+	if err := createV1beta1MutationWebhook(server.EtcdClient, server.EtcdStoragePrefix, client, webhookServer.URL+"/v1beta1/"+mutation, webhookServer.URL+"/v1beta1/convert/"+mutation, convertedV1beta1Rules); err != nil {
 		t.Fatal(err)
 	}
-	if err := createV1beta1ValidationWebhook(client, webhookServer.URL+"/v1beta1/"+validation, webhookServer.URL+"/v1beta1/convert/"+validation, convertedV1beta1Rules); err != nil {
+	if err := createV1beta1ValidationWebhook(server.EtcdClient, server.EtcdStoragePrefix, client, webhookServer.URL+"/v1beta1/"+validation, webhookServer.URL+"/v1beta1/convert/"+validation, convertedV1beta1Rules); err != nil {
 		t.Fatal(err)
 	}
 	if err := createV1MutationWebhook(client, webhookServer.URL+"/v1/"+mutation, webhookServer.URL+"/v1/convert/"+mutation, convertedV1Rules); err != nil {
@@ -831,6 +885,27 @@ func getParentGVR(gvr schema.GroupVersionResource) schema.GroupVersionResource {
 	return parentGVR
 }
 
+func testTokenCreate(c *testContext) {
+	saGVR := gvr("", "v1", "serviceaccounts")
+	sa, err := createOrGetResource(c.client, saGVR, c.resources[saGVR])
+	if err != nil {
+		c.t.Error(err)
+		return
+	}
+
+	c.admissionHolder.expect(c.gvr, gvk(c.resource.Group, c.resource.Version, c.resource.Kind), gvkCreateOptions, v1beta1.Create, sa.GetName(), sa.GetNamespace(), true, false, true)
+	if err = c.clientset.CoreV1().RESTClient().Post().Namespace(sa.GetNamespace()).Resource("serviceaccounts").Name(sa.GetName()).SubResource("token").Body(&authenticationv1.TokenRequest{
+		ObjectMeta: metav1.ObjectMeta{Name: sa.GetName()},
+		Spec: authenticationv1.TokenRequestSpec{
+			Audiences: []string{"api"},
+		},
+	}).Do(context.TODO()).Error(); err != nil {
+		c.t.Error(err)
+		return
+	}
+	c.admissionHolder.verify(c.t)
+}
+
 func testSubresourceUpdate(c *testContext) {
 	if err := retry.RetryOnConflict(retry.DefaultBackoff, func() error {
 		parentGVR := getParentGVR(c.gvr)
@@ -1077,7 +1152,7 @@ func testPodBindingEviction(c *testContext) {
 		}).Do(context.TODO()).Error()
 
 	case gvr("", "v1", "pods/eviction"):
-		err = c.clientset.CoreV1().RESTClient().Post().Namespace(pod.GetNamespace()).Resource("pods").Name(pod.GetName()).SubResource("eviction").Body(&policyv1beta1.Eviction{
+		err = c.clientset.CoreV1().RESTClient().Post().Namespace(pod.GetNamespace()).Resource("pods").Name(pod.GetName()).SubResource("eviction").Body(&policyv1.Eviction{
 			ObjectMeta:    metav1.ObjectMeta{Name: pod.GetName()},
 			DeleteOptions: &forceDelete,
 		}).Do(context.TODO()).Error()
@@ -1265,6 +1340,9 @@ func newV1beta1WebhookHandler(t *testing.T, holder *holder, phase string, conver
 		review.Kind = ""
 		review.Response.UID = ""
 
+		// test plumbing warnings back to the client
+		review.Response.Warnings = []string{makeWarning("v1beta1", phase, converted)}
+
 		// If we're mutating, and have an object, return a patch to exercise conversion
 		if phase == mutation && len(review.Request.Object.Raw) > 0 {
 			review.Response.Patch = []byte(`[{"op":"add","path":"/foo","value":"test"}]`)
@@ -1355,6 +1433,9 @@ func newV1WebhookHandler(t *testing.T, holder *holder, phase string, converted b
 			Allowed: true,
 			UID:     review.Request.UID,
 			Result:  &metav1.Status{Message: "admitted"},
+
+			// test plumbing warnings back
+			Warnings: []string{makeWarning("v1", phase, converted)},
 		}
 		// If we're mutating, and have an object, return a patch to exercise conversion
 		if phase == mutation && len(review.Request.Object.Raw) > 0 {
@@ -1452,11 +1533,10 @@ func shouldTestResourceVerb(gvr schema.GroupVersionResource, resource metav1.API
 // webhook registration helpers
 //
 
-func createV1beta1ValidationWebhook(client clientset.Interface, endpoint, convertedEndpoint string, convertedRules []admissionv1beta1.RuleWithOperations) error {
+func createV1beta1ValidationWebhook(etcdClient *clientv3.Client, etcdStoragePrefix string, client clientset.Interface, endpoint, convertedEndpoint string, convertedRules []admissionv1beta1.RuleWithOperations) error {
 	fail := admissionv1beta1.Fail
 	equivalent := admissionv1beta1.Equivalent
-	// Attaching Admission webhook to API server
-	_, err := client.AdmissionregistrationV1beta1().ValidatingWebhookConfigurations().Create(context.TODO(), &admissionv1beta1.ValidatingWebhookConfiguration{
+	webhookConfig := &admissionv1beta1.ValidatingWebhookConfiguration{
 		ObjectMeta: metav1.ObjectMeta{Name: "admission.integration.test"},
 		Webhooks: []admissionv1beta1.ValidatingWebhook{
 			{
@@ -1484,15 +1564,32 @@ func createV1beta1ValidationWebhook(client clientset.Interface, endpoint, conver
 				AdmissionReviewVersions: []string{"v1beta1"},
 			},
 		},
-	}, metav1.CreateOptions{})
-	return err
+	}
+	// run through to get defaulting
+	apisv1beta1.SetObjectDefaults_ValidatingWebhookConfiguration(webhookConfig)
+	webhookConfig.TypeMeta.Kind = "ValidatingWebhookConfiguration"
+	webhookConfig.TypeMeta.APIVersion = "admissionregistration.k8s.io/v1beta1"
+
+	// Attaching Mutation webhook to API server
+	ctx := genericapirequest.WithNamespace(genericapirequest.NewContext(), metav1.NamespaceNone)
+	key := path.Join("/", etcdStoragePrefix, "validatingwebhookconfigurations", webhookConfig.Name)
+	val, _ := json.Marshal(webhookConfig)
+	if _, err := etcdClient.Put(ctx, key, string(val)); err != nil {
+		return err
+	}
+
+	// make sure we can get the webhook
+	if _, err := client.AdmissionregistrationV1().ValidatingWebhookConfigurations().Get(context.TODO(), webhookConfig.Name, metav1.GetOptions{}); err != nil {
+		return err
+	}
+
+	return nil
 }
 
-func createV1beta1MutationWebhook(client clientset.Interface, endpoint, convertedEndpoint string, convertedRules []admissionv1beta1.RuleWithOperations) error {
+func createV1beta1MutationWebhook(etcdClient *clientv3.Client, etcdStoragePrefix string, client clientset.Interface, endpoint, convertedEndpoint string, convertedRules []admissionv1beta1.RuleWithOperations) error {
 	fail := admissionv1beta1.Fail
 	equivalent := admissionv1beta1.Equivalent
-	// Attaching Mutation webhook to API server
-	_, err := client.AdmissionregistrationV1beta1().MutatingWebhookConfigurations().Create(context.TODO(), &admissionv1beta1.MutatingWebhookConfiguration{
+	webhookConfig := &admissionv1beta1.MutatingWebhookConfiguration{
 		ObjectMeta: metav1.ObjectMeta{Name: "mutation.integration.test"},
 		Webhooks: []admissionv1beta1.MutatingWebhook{
 			{
@@ -1520,8 +1617,26 @@ func createV1beta1MutationWebhook(client clientset.Interface, endpoint, converte
 				AdmissionReviewVersions: []string{"v1beta1"},
 			},
 		},
-	}, metav1.CreateOptions{})
-	return err
+	}
+	// run through to get defaulting
+	apisv1beta1.SetObjectDefaults_MutatingWebhookConfiguration(webhookConfig)
+	webhookConfig.TypeMeta.Kind = "MutatingWebhookConfiguration"
+	webhookConfig.TypeMeta.APIVersion = "admissionregistration.k8s.io/v1beta1"
+
+	// Attaching Mutation webhook to API server
+	ctx := genericapirequest.WithNamespace(genericapirequest.NewContext(), metav1.NamespaceNone)
+	key := path.Join("/", etcdStoragePrefix, "mutatingwebhookconfigurations", webhookConfig.Name)
+	val, _ := json.Marshal(webhookConfig)
+	if _, err := etcdClient.Put(ctx, key, string(val)); err != nil {
+		return err
+	}
+
+	// make sure we can get the webhook
+	if _, err := client.AdmissionregistrationV1().MutatingWebhookConfigurations().Get(context.TODO(), webhookConfig.Name, metav1.GetOptions{}); err != nil {
+		return err
+	}
+
+	return nil
 }
 
 func createV1ValidationWebhook(client clientset.Interface, endpoint, convertedEndpoint string, convertedRules []admissionv1.RuleWithOperations) error {

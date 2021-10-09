@@ -25,14 +25,11 @@ import (
 	"time"
 
 	api "k8s.io/api/core/v1"
-	v1 "k8s.io/api/core/v1"
 	storage "k8s.io/api/storage/v1"
 	meta "k8s.io/apimachinery/pkg/apis/meta/v1"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/wait"
-	"k8s.io/apimachinery/pkg/watch"
 	utilfeature "k8s.io/apiserver/pkg/util/feature"
 	"k8s.io/client-go/informers"
 	fakeclient "k8s.io/client-go/kubernetes/fake"
@@ -47,17 +44,20 @@ import (
 // based on operations from the volume manager/reconciler/operation executor
 func TestCSI_VolumeAll(t *testing.T) {
 	defer featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, features.CSIInlineVolume, true)()
+	defaultFSGroupPolicy := storage.ReadWriteOnceWithFSTypeFSGroupPolicy
 
 	tests := []struct {
-		name       string
-		specName   string
-		driver     string
-		volName    string
-		specFunc   func(specName, driver, volName string) *volume.Spec
-		podFunc    func() *api.Pod
-		isInline   bool
-		shouldFail bool
-		driverSpec *storage.CSIDriverSpec
+		name                            string
+		specName                        string
+		driver                          string
+		volName                         string
+		specFunc                        func(specName, driver, volName string) *volume.Spec
+		podFunc                         func() *api.Pod
+		isInline                        bool
+		shouldFail                      bool
+		disableFSGroupPolicyFeatureGate bool
+		driverSpec                      *storage.CSIDriverSpec
+		watchTimeout                    time.Duration
 	}{
 		{
 			name:     "PersistentVolume",
@@ -87,6 +87,26 @@ func TestCSI_VolumeAll(t *testing.T) {
 			driverSpec: &storage.CSIDriverSpec{
 				// Required for the driver to be accepted for the persistent volume.
 				VolumeLifecycleModes: []storage.VolumeLifecycleMode{storage.VolumeLifecyclePersistent},
+				FSGroupPolicy:        &defaultFSGroupPolicy,
+			},
+		},
+		{
+			name:     "PersistentVolume with driver info and FSGroup disabled",
+			specName: "pv2",
+			driver:   "simple-driver",
+			volName:  "vol2",
+			specFunc: func(specName, driver, volName string) *volume.Spec {
+				return volume.NewSpecFromPersistentVolume(makeTestPV(specName, 20, driver, volName), false)
+			},
+			podFunc: func() *api.Pod {
+				podUID := types.UID(fmt.Sprintf("%08X", rand.Uint64()))
+				return &api.Pod{ObjectMeta: meta.ObjectMeta{UID: podUID, Namespace: testns}}
+			},
+			disableFSGroupPolicyFeatureGate: true,
+			driverSpec: &storage.CSIDriverSpec{
+				// Required for the driver to be accepted for the persistent volume.
+				VolumeLifecycleModes: []storage.VolumeLifecycleMode{storage.VolumeLifecyclePersistent},
+				FSGroupPolicy:        &defaultFSGroupPolicy,
 			},
 		},
 		{
@@ -104,6 +124,7 @@ func TestCSI_VolumeAll(t *testing.T) {
 			driverSpec: &storage.CSIDriverSpec{
 				// This will cause the volume to be rejected.
 				VolumeLifecycleModes: []storage.VolumeLifecycleMode{storage.VolumeLifecycleEphemeral},
+				FSGroupPolicy:        &defaultFSGroupPolicy,
 			},
 			shouldFail: true,
 		},
@@ -122,6 +143,7 @@ func TestCSI_VolumeAll(t *testing.T) {
 			driverSpec: &storage.CSIDriverSpec{
 				// Required for the driver to be accepted for the inline volume.
 				VolumeLifecycleModes: []storage.VolumeLifecycleMode{storage.VolumeLifecycleEphemeral},
+				FSGroupPolicy:        &defaultFSGroupPolicy,
 			},
 		},
 		{
@@ -139,6 +161,7 @@ func TestCSI_VolumeAll(t *testing.T) {
 			driverSpec: &storage.CSIDriverSpec{
 				// Required for the driver to be accepted for the inline volume.
 				VolumeLifecycleModes: []storage.VolumeLifecycleMode{storage.VolumeLifecyclePersistent, storage.VolumeLifecycleEphemeral},
+				FSGroupPolicy:        &defaultFSGroupPolicy,
 			},
 		},
 		{
@@ -221,6 +244,8 @@ func TestCSI_VolumeAll(t *testing.T) {
 
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
+			defer featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, features.CSIInlineVolume, !test.disableFSGroupPolicyFeatureGate)()
+
 			tmpDir, err := utiltesting.MkTmpdir("csi-test")
 			if err != nil {
 				t.Fatalf("can't create temp dir: %v", err)
@@ -231,22 +256,21 @@ func TestCSI_VolumeAll(t *testing.T) {
 			objs := []runtime.Object{}
 			if test.driverSpec != nil {
 				driverInfo = &storage.CSIDriver{
-					ObjectMeta: metav1.ObjectMeta{
+					ObjectMeta: meta.ObjectMeta{
 						Name: test.driver,
 					},
 					Spec: *test.driverSpec,
 				}
 				objs = append(objs, driverInfo)
 			}
-			objs = append(objs, &v1.Node{
-				ObjectMeta: metav1.ObjectMeta{
+			objs = append(objs, &api.Node{
+				ObjectMeta: meta.ObjectMeta{
 					Name: "fakeNode",
 				},
-				Spec: v1.NodeSpec{},
+				Spec: api.NodeSpec{},
 			})
 
 			client := fakeclient.NewSimpleClientset(objs...)
-			fakeWatcher := watch.NewRaceFreeFake()
 
 			factory := informers.NewSharedInformerFactory(client, time.Hour /* disable resync */)
 			csiDriverInformer := factory.Storage().V1().CSIDrivers()
@@ -254,9 +278,11 @@ func TestCSI_VolumeAll(t *testing.T) {
 			if driverInfo != nil {
 				csiDriverInformer.Informer().GetStore().Add(driverInfo)
 			}
-			factory.Start(wait.NeverStop)
 
-			host := volumetest.NewFakeVolumeHostWithCSINodeName(t,
+			factory.Start(wait.NeverStop)
+			factory.WaitForCacheSync(wait.NeverStop)
+
+			attachDetachVolumeHost := volumetest.NewFakeAttachDetachVolumeHostWithCSINodeName(t,
 				tmpDir,
 				client,
 				ProbeVolumePlugins(),
@@ -264,18 +290,18 @@ func TestCSI_VolumeAll(t *testing.T) {
 				csiDriverInformer.Lister(),
 				volumeAttachmentInformer.Lister(),
 			)
-			plugMgr := host.GetPluginMgr()
+			attachDetachPlugMgr := attachDetachVolumeHost.GetPluginMgr()
 			csiClient := setupClient(t, true)
 
 			volSpec := test.specFunc(test.specName, test.driver, test.volName)
 			pod := test.podFunc()
-			attachName := getAttachmentName(test.volName, test.driver, string(host.GetNodeName()))
+			attachName := getAttachmentName(test.volName, test.driver, string(attachDetachVolumeHost.GetNodeName()))
 			t.Log("csiTest.VolumeAll starting...")
 
 			// *************** Attach/Mount volume resources ****************//
 			// attach volume
 			t.Log("csiTest.VolumeAll Attaching volume...")
-			attachPlug, err := plugMgr.FindAttachablePluginBySpec(volSpec)
+			attachPlug, err := attachDetachPlugMgr.FindAttachablePluginBySpec(volSpec)
 			if err != nil {
 				if !test.shouldFail {
 					t.Fatalf("csiTest.VolumeAll PluginManager.FindAttachablePluginBySpec failed: %v", err)
@@ -304,19 +330,19 @@ func TestCSI_VolumeAll(t *testing.T) {
 				}
 
 				// creates VolumeAttachment and blocks until it is marked attached (done by external attacher)
-				go func(spec *volume.Spec, nodeName types.NodeName) {
-					attachID, err := volAttacher.Attach(spec, nodeName)
+				go func() {
+					attachID, err := volAttacher.Attach(volSpec, attachDetachVolumeHost.GetNodeName())
 					if err != nil {
 						t.Errorf("csiTest.VolumeAll attacher.Attach failed: %s", err)
 						return
 					}
 					t.Logf("csiTest.VolumeAll got attachID %s", attachID)
-
-				}(volSpec, host.GetNodeName())
+				}()
 
 				// Simulates external-attacher and marks VolumeAttachment.Status.Attached = true
-				markVolumeAttached(t, host.GetKubeClient(), fakeWatcher, attachName, storage.VolumeAttachmentStatus{Attached: true})
+				markVolumeAttached(t, attachDetachVolumeHost.GetKubeClient(), nil, attachName, storage.VolumeAttachmentStatus{Attached: true})
 
+				// Observe attach on this node.
 				devicePath, err = volAttacher.WaitForAttach(volSpec, "", pod, 500*time.Millisecond)
 				if err != nil {
 					t.Fatal("csiTest.VolumeAll attacher.WaitForAttach failed:", err)
@@ -332,9 +358,22 @@ func TestCSI_VolumeAll(t *testing.T) {
 				t.Log("csiTest.VolumeAll volume attacher not found, skipping attachment")
 			}
 
+			// The reason for separate volume hosts here is because the attach/detach behavior is exclusive to the
+			// CSI plugin running in the AttachDetachController. Similarly, the mount/unmount behavior is exclusive
+			// to the CSI plugin running in the Kubelet.
+			kubeletVolumeHost := volumetest.NewFakeKubeletVolumeHostWithCSINodeName(t,
+				tmpDir,
+				client,
+				ProbeVolumePlugins(),
+				"fakeNode",
+				csiDriverInformer.Lister(),
+				volumeAttachmentInformer.Lister(),
+			)
+			kubeletPlugMgr := kubeletVolumeHost.GetPluginMgr()
+
 			// Mount Device
 			t.Log("csiTest.VolumeAll Mouting device...")
-			devicePlug, err := plugMgr.FindDeviceMountablePluginBySpec(volSpec)
+			devicePlug, err := kubeletPlugMgr.FindDeviceMountablePluginBySpec(volSpec)
 			if err != nil {
 				t.Fatalf("csiTest.VolumeAll PluginManager.FindDeviceMountablePluginBySpec failed: %v", err)
 			}
@@ -355,13 +394,13 @@ func TestCSI_VolumeAll(t *testing.T) {
 			}
 
 			if devMounter != nil {
-				csiDevMounter := devMounter.(*csiAttacher)
+				csiDevMounter := getCsiAttacherFromDeviceMounter(devMounter, test.watchTimeout)
 				csiDevMounter.csiClient = csiClient
 				devMountPath, err := csiDevMounter.GetDeviceMountPath(volSpec)
 				if err != nil {
 					t.Fatalf("csiTest.VolumeAll deviceMounter.GetdeviceMountPath failed %s", err)
 				}
-				if err := csiDevMounter.MountDevice(volSpec, devicePath, devMountPath); err != nil {
+				if err := csiDevMounter.MountDevice(volSpec, devicePath, devMountPath, volume.DeviceMounterArgs{}); err != nil {
 					t.Fatalf("csiTest.VolumeAll deviceMounter.MountDevice failed: %v", err)
 				}
 				t.Log("csiTest.VolumeAll device mounted at path:", devMountPath)
@@ -371,7 +410,7 @@ func TestCSI_VolumeAll(t *testing.T) {
 
 			// mount volume
 			t.Log("csiTest.VolumeAll Mouting volume...")
-			volPlug, err := plugMgr.FindPluginBySpec(volSpec)
+			volPlug, err := kubeletPlugMgr.FindPluginBySpec(volSpec)
 			if err != nil || volPlug == nil {
 				t.Fatalf("csiTest.VolumeAll PluginMgr.FindPluginBySpec failed: %v", err)
 			}
@@ -467,7 +506,7 @@ func TestCSI_VolumeAll(t *testing.T) {
 			t.Log("csiTest.VolumeAll Tearing down...")
 			// unmount volume
 			t.Log("csiTest.VolumeAll Unmouting volume...")
-			volPlug, err = plugMgr.FindPluginBySpec(volSpec)
+			volPlug, err = kubeletPlugMgr.FindPluginBySpec(volSpec)
 			if err != nil || volPlug == nil {
 				t.Fatalf("csiTest.VolumeAll PluginMgr.FindPluginBySpec failed: %v", err)
 			}
@@ -493,7 +532,7 @@ func TestCSI_VolumeAll(t *testing.T) {
 
 			// unmount device
 			t.Log("csiTest.VolumeAll Unmouting device...")
-			devicePlug, err = plugMgr.FindDeviceMountablePluginBySpec(volSpec)
+			devicePlug, err = kubeletPlugMgr.FindDeviceMountablePluginBySpec(volSpec)
 			if err != nil {
 				t.Fatalf("csiTest.VolumeAll failed to create mountable device plugin: %s", err)
 			}
@@ -518,8 +557,8 @@ func TestCSI_VolumeAll(t *testing.T) {
 				}
 
 				if devMounter != nil && devUnmounter != nil {
-					csiDevMounter := devMounter.(*csiAttacher)
-					csiDevUnmounter := devUnmounter.(*csiAttacher)
+					csiDevMounter := getCsiAttacherFromDeviceMounter(devMounter, test.watchTimeout)
+					csiDevUnmounter := getCsiAttacherFromDeviceUnmounter(devUnmounter, test.watchTimeout)
 					csiDevUnmounter.csiClient = csiClient
 
 					devMountPath, err := csiDevMounter.GetDeviceMountPath(volSpec)
@@ -529,7 +568,7 @@ func TestCSI_VolumeAll(t *testing.T) {
 					if err := csiDevUnmounter.UnmountDevice(devMountPath); err != nil {
 						t.Fatalf("csiTest.VolumeAll deviceMounter.UnmountDevice failed: %s", err)
 					}
-					t.Log("csiTest.VolumeAll deviceUmounter.UnmountDevice done OK for path", devMountPath)
+					t.Log("csiTest.VolumeAll deviceUnmounter.UnmountDevice done OK for path", devMountPath)
 				}
 			} else {
 				t.Log("csiTest.VolumeAll DeviceMountablePluginBySpec did not find a plugin, skipping unmounting.")
@@ -537,7 +576,7 @@ func TestCSI_VolumeAll(t *testing.T) {
 
 			// detach volume
 			t.Log("csiTest.VolumeAll Detaching volume...")
-			attachPlug, err = plugMgr.FindAttachablePluginBySpec(volSpec)
+			attachPlug, err = attachDetachPlugMgr.FindAttachablePluginBySpec(volSpec)
 			if err != nil {
 				t.Fatalf("csiTest.VolumeAll PluginManager.FindAttachablePluginBySpec failed: %v", err)
 			}
@@ -560,9 +599,9 @@ func TestCSI_VolumeAll(t *testing.T) {
 				if err != nil {
 					t.Fatal("csiTest.VolumeAll volumePlugin.GetVolumeName failed:", err)
 				}
-				csiDetacher := volDetacher.(*csiAttacher)
+				csiDetacher := getCsiAttacherFromVolumeDetacher(volDetacher, test.watchTimeout)
 				csiDetacher.csiClient = csiClient
-				if err := csiDetacher.Detach(volName, host.GetNodeName()); err != nil {
+				if err := csiDetacher.Detach(volName, attachDetachVolumeHost.GetNodeName()); err != nil {
 					t.Fatal("csiTest.VolumeAll detacher.Detach failed:", err)
 				}
 				t.Log("csiTest.VolumeAll detacher.Detach succeeded for volume", volName)

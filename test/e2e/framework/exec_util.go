@@ -43,19 +43,22 @@ type ExecOptions struct {
 	CaptureStderr bool
 	// If false, whitespace in std{err,out} will be removed.
 	PreserveWhitespace bool
+	Quiet              bool
 }
 
 // ExecWithOptions executes a command in the specified container,
 // returning stdout, stderr and error. `options` allowed for
 // additional parameters to be passed.
 func (f *Framework) ExecWithOptions(options ExecOptions) (string, string, error) {
-	Logf("ExecWithOptions %+v", options)
-
+	if !options.Quiet {
+		Logf("ExecWithOptions %+v", options)
+	}
 	config, err := LoadConfig()
 	ExpectNoError(err, "failed to load restclient config")
 
 	const tty = false
 
+	Logf("ExecWithOptions: Clientset creation")
 	req := f.ClientSet.CoreV1().RESTClient().Post().
 		Resource("pods").
 		Name(options.PodName).
@@ -72,8 +75,8 @@ func (f *Framework) ExecWithOptions(options ExecOptions) (string, string, error)
 	}, scheme.ParameterCodec)
 
 	var stdout, stderr bytes.Buffer
+	Logf("ExecWithOptions: execute(POST %s %s)", req.URL())
 	err = execute("POST", req.URL(), config, options.Stdin, &stdout, &stderr, tty)
-
 	if options.PreserveWhitespace {
 		return stdout.String(), stderr.String(), err
 	}

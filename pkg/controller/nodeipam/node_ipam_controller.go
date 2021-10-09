@@ -28,7 +28,6 @@ import (
 	"k8s.io/client-go/tools/cache"
 	"k8s.io/client-go/tools/record"
 
-	v1 "k8s.io/api/core/v1"
 	coreinformers "k8s.io/client-go/informers/core/v1"
 	clientset "k8s.io/client-go/kubernetes"
 	corelisters "k8s.io/client-go/listers/core/v1"
@@ -65,8 +64,6 @@ type Controller struct {
 	nodeInformerSynced cache.InformerSynced
 
 	cidrAllocator ipam.CIDRAllocator
-
-	forcefullyDeletePod func(*v1.Pod) error
 }
 
 // NewNodeIpamController returns a new node IP Address Management controller to
@@ -107,11 +104,6 @@ func NewNodeIpamController(
 			klog.Fatal("Controller: Must specify --cluster-cidr if --allocate-node-cidrs is set")
 		}
 
-		// TODO: (khenidak) IPv6DualStack beta:
-		// - modify mask to allow flexible masks for IPv4 and IPv6
-		// - for alpha status they are the same
-
-		// for each cidr, node mask size must be <= cidr mask
 		for idx, cidr := range clusterCIDRs {
 			mask := cidr.Mask
 			if maskSize, _ := mask.Size(); maskSize > nodeCIDRMaskSizes[idx] {

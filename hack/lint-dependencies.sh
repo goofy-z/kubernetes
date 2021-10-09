@@ -38,47 +38,16 @@ fi
 kube::golang::verify_go_version
 kube::util::require-jq
 
-case "${1:-}" in
-"--all")
-  echo "Checking all dependencies"
-  filter=''
-  ;;
-"-a")
-  echo "Checking all dependencies"
-  filter=''
-  ;;
-"")
-  # by default, skip checking golang.org/x/... dependencies... we pin to levels that match our go version for those
-  echo "Skipping golang.org/x/... dependencies, pass --all to include"
-  filter='select(.Path | startswith("golang.org/x/") | not) |'
-  ;;
-*)
-  kube::log::error "Unrecognized arg: ${1}"
-  exit 1
-  ;;
-esac
-
 # let us log all errors before we exit
 rc=0
 
 # List of dependencies we need to avoid dragging back into kubernetes/kubernetes
-forbidden_repos=(
-  "k8s.io/klog"  # we have switched to klog v2, so avoid klog v1
-)
-for forbidden_repo in "${forbidden_repos[@]}"; do
-  deps_on_forbidden=$(go mod graph | grep " ${forbidden_repo}@" || echo "")
-  if [ -n "${deps_on_forbidden}" ]; then
-    kube::log::error "The following have transitive dependencies on ${forbidden_repo}, which is not allowed:"
-    echo "${deps_on_forbidden}"
-    echo ""
-    rc=1
-  fi
-done
+# Check if unwanted dependencies are removed
+go run k8s.io/kubernetes/cmd/dependencyverifier "${KUBE_ROOT}/hack/unwanted-dependencies.json"
 
 outdated=$(go list -m -json all | jq -r "
   select(.Replace.Version != null) |
   select(.Version != .Replace.Version) |
-  ${filter}
   select(.Path) |
   \"\(.Path)
     pinned:    \(.Replace.Version)

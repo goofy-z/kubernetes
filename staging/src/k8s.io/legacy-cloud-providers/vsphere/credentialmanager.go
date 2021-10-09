@@ -1,3 +1,4 @@
+//go:build !providerless
 // +build !providerless
 
 /*
@@ -53,7 +54,7 @@ type SecretCache struct {
 
 type Credential struct {
 	User     string `gcfg:"user"`
-	Password string `gcfg:"password"`
+	Password string `gcfg:"password" datapolicy:"password"`
 }
 
 type SecretCredentialManager struct {

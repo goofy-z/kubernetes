@@ -17,6 +17,7 @@ limitations under the License.
 package node
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -31,29 +32,33 @@ import (
 	v1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/fields"
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/util/uuid"
 	"k8s.io/apimachinery/pkg/util/wait"
 	"k8s.io/apimachinery/pkg/watch"
+	"k8s.io/kubernetes/pkg/kubelet/events"
 	"k8s.io/kubernetes/test/e2e/framework"
 	e2ekubelet "k8s.io/kubernetes/test/e2e/framework/kubelet"
 	e2epod "k8s.io/kubernetes/test/e2e/framework/pod"
 	imageutils "k8s.io/kubernetes/test/utils/image"
 
 	"github.com/onsi/ginkgo"
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/common/expfmt"
 )
 
 var _ = SIGDescribe("Pods Extended", func() {
 	f := framework.NewDefaultFramework("pods")
 
-	framework.KubeDescribe("Delete Grace Period", func() {
+	ginkgo.Describe("Delete Grace Period", func() {
 		var podClient *framework.PodClient
 		ginkgo.BeforeEach(func() {
 			podClient = f.PodClient()
 		})
 
 		/*
-			Release : v1.15
+			Release: v1.15
 			Testname: Pods, delete grace period
 			Description: Create a pod, make sure it is running. Using the http client send a 'delete' with gracePeriodSeconds=30. Pod SHOULD get terminated within gracePeriodSeconds and removed from API server within a window.
 		*/
@@ -61,23 +66,10 @@ var _ = SIGDescribe("Pods Extended", func() {
 			ginkgo.By("creating the pod")
 			name := "pod-submit-remove-" + string(uuid.NewUUID())
 			value := strconv.Itoa(time.Now().Nanosecond())
-			pod := &v1.Pod{
-				ObjectMeta: metav1.ObjectMeta{
-					Name: name,
-					Labels: map[string]string{
-						"name": "foo",
-						"time": value,
-					},
-				},
-				Spec: v1.PodSpec{
-					Containers: []v1.Container{
-						{
-							Name:  "agnhost",
-							Image: imageutils.GetE2EImage(imageutils.Agnhost),
-							Args:  []string{"pause"},
-						},
-					},
-				},
+			pod := e2epod.NewAgnhostPod(f.Namespace.Name, name, nil, nil, nil)
+			pod.ObjectMeta.Labels = map[string]string{
+				"name": "foo",
+				"time": value,
 			}
 
 			ginkgo.By("setting up selector")
@@ -86,10 +78,6 @@ var _ = SIGDescribe("Pods Extended", func() {
 			pods, err := podClient.List(context.TODO(), options)
 			framework.ExpectNoError(err, "failed to query for pod")
 			framework.ExpectEqual(len(pods.Items), 0)
-			options = metav1.ListOptions{
-				LabelSelector:   selector.String(),
-				ResourceVersion: pods.ListMeta.ResourceVersion,
-			}
 
 			ginkgo.By("submitting the pod to kubernetes")
 			podClient.Create(pod)
@@ -156,18 +144,16 @@ var _ = SIGDescribe("Pods Extended", func() {
 		})
 	})
 
-	framework.KubeDescribe("Pods Set QOS Class", func() {
+	ginkgo.Describe("Pods Set QOS Class", func() {
 		var podClient *framework.PodClient
 		ginkgo.BeforeEach(func() {
 			podClient = f.PodClient()
 		})
 
 		/*
-			Release : v1.9
+			Release: v1.9
 			Testname: Pods, QOS
 			Description:  Create a Pod with CPU and Memory request and limits. Pod status MUST have QOSClass set to PodQOSGuaranteed.
-			Behaviors:
-			- pod/spec/container/resources
 		*/
 		framework.ConformanceIt("should be set on Pods with matching resource requests and limits for memory and cpu", func() {
 			ginkgo.By("creating the pod")
@@ -210,7 +196,7 @@ var _ = SIGDescribe("Pods Extended", func() {
 		})
 	})
 
-	framework.KubeDescribe("Pod Container Status", func() {
+	ginkgo.Describe("Pod Container Status", func() {
 		var podClient *framework.PodClient
 		ginkgo.BeforeEach(func() {
 			podClient = f.PodClient()
@@ -219,7 +205,7 @@ var _ = SIGDescribe("Pods Extended", func() {
 		ginkgo.It("should never report success for a pending container", func() {
 			ginkgo.By("creating pods that should always exit 1 and terminating the pod after a random delay")
 
-			var reBug88766 = regexp.MustCompile(`rootfs_linux.*kubernetes\.io~secret.*no such file or directory`)
+			var reBug88766 = regexp.MustCompile(`rootfs_linux.*kubernetes\.io~(secret|projected).*no such file or directory`)
 
 			var (
 				lock sync.Mutex
@@ -227,6 +213,18 @@ var _ = SIGDescribe("Pods Extended", func() {
 
 				wg sync.WaitGroup
 			)
+
+			r := prometheus.NewRegistry()
+			h := prometheus.NewSummaryVec(prometheus.SummaryOpts{
+				Name: "start_latency",
+				Objectives: map[float64]float64{
+					0.5:  0.05,
+					0.75: 0.025,
+					0.9:  0.01,
+					0.99: 0.001,
+				},
+			}, []string{"node"})
+			r.MustRegister(h)
 
 			const delay = 2000
 			const workers = 3
@@ -274,6 +272,7 @@ var _ = SIGDescribe("Pods Extended", func() {
 						start := time.Now()
 						created := podClient.Create(pod)
 						ch := make(chan []watch.Event)
+						waitForWatch := make(chan struct{})
 						go func() {
 							defer ginkgo.GinkgoRecover()
 							defer close(ch)
@@ -286,6 +285,7 @@ var _ = SIGDescribe("Pods Extended", func() {
 								return
 							}
 							defer w.Stop()
+							close(waitForWatch)
 							events := []watch.Event{
 								{Type: watch.Added, Object: created},
 							}
@@ -302,6 +302,10 @@ var _ = SIGDescribe("Pods Extended", func() {
 							ch <- events
 						}()
 
+						select {
+						case <-ch: // in case the goroutine above exits before establishing the watch
+						case <-waitForWatch: // when the watch is established
+						}
 						t := time.Duration(rand.Intn(delay)) * time.Millisecond
 						time.Sleep(t)
 						err := podClient.Delete(context.TODO(), pod.Name, metav1.DeleteOptions{})
@@ -359,10 +363,15 @@ var _ = SIGDescribe("Pods Extended", func() {
 									return fmt.Errorf("pod %s on node %s was terminated and then had termination cleared: %#v", pod.Name, pod.Spec.NodeName, status)
 								}
 							}
+							var hasNoStartTime bool
 							hasRunningContainers = status.State.Waiting == nil && status.State.Terminated == nil
 							if t != nil {
 								if !t.FinishedAt.Time.IsZero() {
-									duration = t.FinishedAt.Sub(t.StartedAt.Time)
+									if t.StartedAt.IsZero() {
+										hasNoStartTime = true
+									} else {
+										duration = t.FinishedAt.Sub(t.StartedAt.Time)
+									}
 									completeDuration = t.FinishedAt.Sub(pod.CreationTimestamp.Time)
 								}
 
@@ -370,11 +379,23 @@ var _ = SIGDescribe("Pods Extended", func() {
 								switch {
 								case t.ExitCode == 1:
 									// expected
+								case t.ExitCode == 137 && (t.Reason == "ContainerStatusUnknown" || t.Reason == "Error"):
+									// expected, pod was force-killed after grace period
 								case t.ExitCode == 128 && (t.Reason == "StartError" || t.Reason == "ContainerCannotRun") && reBug88766.MatchString(t.Message):
 									// pod volume teardown races with container start in CRI, which reports a failure
 									framework.Logf("pod %s on node %s failed with the symptoms of https://github.com/kubernetes/kubernetes/issues/88766", pod.Name, pod.Spec.NodeName)
 								default:
+									data, _ := json.MarshalIndent(pod.Status, "", "  ")
+									framework.Logf("pod %s on node %s had incorrect final status:\n%s", pod.Name, pod.Spec.NodeName, string(data))
 									return fmt.Errorf("pod %s on node %s container unexpected exit code %d: start=%s end=%s reason=%s message=%s", pod.Name, pod.Spec.NodeName, t.ExitCode, t.StartedAt, t.FinishedAt, t.Reason, t.Message)
+								}
+								switch {
+								case duration > time.Hour:
+									// problem with status reporting
+									return fmt.Errorf("pod %s container %s on node %s had very long duration %s: start=%s end=%s", pod.Name, status.Name, pod.Spec.NodeName, duration, t.StartedAt, t.FinishedAt)
+								case hasNoStartTime:
+									// should never happen
+									return fmt.Errorf("pod %s container %s on node %s had finish time but not start time: end=%s", pod.Name, status.Name, pod.Spec.NodeName, t.FinishedAt)
 								}
 							}
 							if pod.Status.Phase == v1.PodFailed || pod.Status.Phase == v1.PodSucceeded {
@@ -406,7 +427,7 @@ var _ = SIGDescribe("Pods Extended", func() {
 							if !hasTerminalPhase {
 								var names []string
 								for _, status := range pod.Status.ContainerStatuses {
-									if status.State.Terminated != nil || status.State.Running != nil {
+									if status.State.Running != nil {
 										names = append(names, status.Name)
 									}
 								}
@@ -429,6 +450,7 @@ var _ = SIGDescribe("Pods Extended", func() {
 						if duration > max || max == 0 {
 							max = duration
 						}
+						h.WithLabelValues(pod.Spec.NodeName).Observe(end.Sub(start).Seconds())
 						framework.Logf("Pod %s on node %s timings total=%s t=%s run=%s execute=%s", pod.Name, pod.Spec.NodeName, end.Sub(start), t, completeDuration, duration)
 					}
 
@@ -443,6 +465,89 @@ var _ = SIGDescribe("Pods Extended", func() {
 					messages = append(messages, err.Error())
 				}
 				framework.Failf("%d errors:\n%v", len(errs), strings.Join(messages, "\n"))
+			}
+			values, _ := r.Gather()
+			var buf bytes.Buffer
+			for _, m := range values {
+				expfmt.MetricFamilyToText(&buf, m)
+			}
+			framework.Logf("Summary of latencies:\n%s", buf.String())
+		})
+	})
+
+	ginkgo.Describe("Pod Container lifecycle", func() {
+		var podClient *framework.PodClient
+		ginkgo.BeforeEach(func() {
+			podClient = f.PodClient()
+		})
+
+		ginkgo.It("should not create extra sandbox if all containers are done", func() {
+			ginkgo.By("creating the pod that should always exit 0")
+
+			name := "pod-always-succeed" + string(uuid.NewUUID())
+			image := imageutils.GetE2EImage(imageutils.BusyBox)
+			pod := &v1.Pod{
+				ObjectMeta: metav1.ObjectMeta{
+					Name: name,
+				},
+				Spec: v1.PodSpec{
+					RestartPolicy: v1.RestartPolicyOnFailure,
+					InitContainers: []v1.Container{
+						{
+							Name:  "foo",
+							Image: image,
+							Command: []string{
+								"/bin/true",
+							},
+						},
+					},
+					Containers: []v1.Container{
+						{
+							Name:  "bar",
+							Image: image,
+							Command: []string{
+								"/bin/true",
+							},
+						},
+					},
+				},
+			}
+
+			ginkgo.By("submitting the pod to kubernetes")
+			createdPod := podClient.Create(pod)
+			defer func() {
+				ginkgo.By("deleting the pod")
+				podClient.Delete(context.TODO(), pod.Name, metav1.DeleteOptions{})
+			}()
+
+			framework.ExpectNoError(e2epod.WaitForPodSuccessInNamespace(f.ClientSet, pod.Name, f.Namespace.Name))
+
+			var eventList *v1.EventList
+			var err error
+			ginkgo.By("Getting events about the pod")
+			framework.ExpectNoError(wait.Poll(time.Second*2, time.Second*60, func() (bool, error) {
+				selector := fields.Set{
+					"involvedObject.kind":      "Pod",
+					"involvedObject.uid":       string(createdPod.UID),
+					"involvedObject.namespace": f.Namespace.Name,
+					"source":                   "kubelet",
+				}.AsSelector().String()
+				options := metav1.ListOptions{FieldSelector: selector}
+				eventList, err = f.ClientSet.CoreV1().Events(f.Namespace.Name).List(context.TODO(), options)
+				if err != nil {
+					return false, err
+				}
+				if len(eventList.Items) > 0 {
+					return true, nil
+				}
+				return false, nil
+			}))
+
+			ginkgo.By("Checking events about the pod")
+			for _, event := range eventList.Items {
+				if event.Reason == events.SandboxChanged {
+					framework.Fail("Unexpected SandboxChanged event")
+				}
 			}
 		})
 	})

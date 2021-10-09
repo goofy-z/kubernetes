@@ -27,12 +27,12 @@ import (
 	"time"
 
 	"github.com/spf13/pflag"
-	"k8s.io/klog/v2"
-
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	utilfeature "k8s.io/apiserver/pkg/util/feature"
 	cliflag "k8s.io/component-base/cli/flag"
+	"k8s.io/klog/v2"
 	kubeletconfigv1beta1 "k8s.io/kubelet/config/v1beta1"
+
 	"k8s.io/kubernetes/cmd/kubelet/app/options"
 	"k8s.io/kubernetes/pkg/features"
 	kubeletconfig "k8s.io/kubernetes/pkg/kubelet/apis/config"
@@ -87,7 +87,6 @@ func RunKubelet() {
 
 const (
 	// Ports of different e2e services.
-	kubeletPort         = "10250"
 	kubeletReadOnlyPort = "10255"
 	// KubeletRootDirectory specifies the directory where the kubelet runtime information is stored.
 	KubeletRootDirectory = "/var/lib/kubelet"
@@ -195,6 +194,7 @@ func (e *E2EServices) startKubelet() (*server, error) {
 		cmdArgs = append(cmdArgs,
 			systemdRun,
 			"-p", "Delegate=true",
+			"-p", "StandardError=file:"+framework.TestContext.ReportDir+"/kubelet.log",
 			"--unit="+unitName,
 			"--slice=runtime.slice",
 			"--remain-after-exit",
@@ -202,10 +202,6 @@ func (e *E2EServices) startKubelet() (*server, error) {
 
 		killCommand = exec.Command("systemctl", "kill", unitName)
 		restartCommand = exec.Command("systemctl", "restart", unitName)
-		e.logs["kubelet.log"] = LogFileData{
-			Name:              "kubelet.log",
-			JournalctlCommand: []string{"-u", unitName},
-		}
 
 		kc.KubeletCgroups = "/kubelet.slice"
 		kubeletConfigFlags = append(kubeletConfigFlags, "kubelet-cgroups")
@@ -302,6 +298,7 @@ func (e *E2EServices) startKubelet() (*server, error) {
 	}
 
 	cmd := exec.Command(cmdArgs[0], cmdArgs[1:]...)
+	restartOnExit := framework.TestContext.RestartKubelet
 	server := newServer(
 		"kubelet",
 		cmd,
@@ -310,7 +307,7 @@ func (e *E2EServices) startKubelet() (*server, error) {
 		[]string{kubeletHealthCheckURL},
 		"kubelet.log",
 		e.monitorParent,
-		true /* restartOnExit */)
+		restartOnExit)
 	return server, server.start()
 }
 
@@ -356,13 +353,15 @@ func createPodDirectory() (string, error) {
 
 // createKubeconfig creates a kubeconfig file at the fully qualified `path`. The parent dirs must exist.
 func createKubeconfig(path string) error {
-	kubeconfig := []byte(`apiVersion: v1
+	kubeconfig := []byte(fmt.Sprintf(`apiVersion: v1
 kind: Config
 users:
 - name: kubelet
+  user:
+    token: %s
 clusters:
 - cluster:
-    server: ` + getAPIServerClientURL() + `
+    server: %s
     insecure-skip-tls-verify: true
   name: local
 contexts:
@@ -370,7 +369,7 @@ contexts:
     cluster: local
     user: kubelet
   name: local-context
-current-context: local-context`)
+current-context: local-context`, framework.TestContext.BearerToken, getAPIServerClientURL()))
 
 	if err := ioutil.WriteFile(path, kubeconfig, 0666); err != nil {
 		return err

@@ -64,6 +64,8 @@ type Fs struct {
 }
 
 type DiskStats struct {
+	MajorNum        uint64
+	MinorNum        uint64
 	ReadsCompleted  uint64
 	ReadsMerged     uint64
 	SectorsRead     uint64
@@ -75,6 +77,8 @@ type DiskStats struct {
 	IoInProgress    uint64
 	IoTime          uint64
 	WeightedIoTime  uint64
+	Major           uint64
+	Minor           uint64
 }
 
 type UsageInfo struct {

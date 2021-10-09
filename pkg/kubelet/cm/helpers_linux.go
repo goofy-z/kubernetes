@@ -19,11 +19,9 @@ package cm
 import (
 	"bufio"
 	"fmt"
-	"io/ioutil"
 	"os"
 	"path/filepath"
 	"strconv"
-	"strings"
 
 	libcontainercgroups "github.com/opencontainers/runc/libcontainer/cgroups"
 
@@ -38,8 +36,11 @@ import (
 )
 
 const (
-	// Taken from lmctfy https://github.com/google/lmctfy/blob/master/lmctfy/controllers/cpu_controller.cc
-	MinShares     = 2
+	// These limits are defined in the kernel:
+	// https://github.com/torvalds/linux/blob/0bddd227f3dc55975e2b8dfa7fc6f959b062a2c7/kernel/sched/sched.h#L427-L428
+	MinShares = 2
+	MaxShares = 262144
+
 	SharesPerCPU  = 1024
 	MilliCPUToCPU = 1000
 
@@ -88,6 +89,9 @@ func MilliCPUToShares(milliCPU int64) uint64 {
 	if shares < MinShares {
 		return MinShares
 	}
+	if shares > MaxShares {
+		return MaxShares
+	}
 	return uint64(shares)
 }
 
@@ -109,7 +113,7 @@ func HugePageLimits(resourceList v1.ResourceList) map[int64]int64 {
 }
 
 // ResourceConfigForPod takes the input pod and outputs the cgroup resource config.
-func ResourceConfigForPod(pod *v1.Pod, enforceCPULimits bool, cpuPeriod uint64) *ResourceConfig {
+func ResourceConfigForPod(pod *v1.Pod, enforceCPULimits bool, cpuPeriod uint64, enforceMemoryQoS bool) *ResourceConfig {
 	// sum requests and limits.
 	reqs, limits := resource.PodRequestsAndLimits(pod)
 
@@ -152,6 +156,21 @@ func ResourceConfigForPod(pod *v1.Pod, enforceCPULimits bool, cpuPeriod uint64) 
 		}
 	}
 
+	for _, container := range pod.Spec.InitContainers {
+		if container.Resources.Limits.Cpu().IsZero() {
+			cpuLimitsDeclared = false
+		}
+		if container.Resources.Limits.Memory().IsZero() {
+			memoryLimitsDeclared = false
+		}
+		containerHugePageLimits := HugePageLimits(container.Resources.Requests)
+		for k, v := range containerHugePageLimits {
+			if value, exists := hugePageLimits[k]; !exists || v > value {
+				hugePageLimits[k] = v
+			}
+		}
+	}
+
 	// quota is not capped when cfs quota is disabled
 	if !enforceCPULimits {
 		cpuQuota = int64(-1)
@@ -181,6 +200,19 @@ func ResourceConfigForPod(pod *v1.Pod, enforceCPULimits bool, cpuPeriod uint64) 
 		result.CpuShares = &shares
 	}
 	result.HugePageLimit = hugePageLimits
+
+	if enforceMemoryQoS {
+		memoryMin := int64(0)
+		if request, found := reqs[v1.ResourceMemory]; found {
+			memoryMin = request.Value()
+		}
+		if memoryMin > 0 {
+			result.Unified = map[string]string{
+				MemoryMin: strconv.FormatInt(memoryMin, 10),
+			}
+		}
+	}
+
 	return result
 }
 
@@ -196,8 +228,16 @@ func getCgroupSubsystemsV1() (*CgroupSubsystems, error) {
 	}
 	mountPoints := make(map[string]string, len(allCgroups))
 	for _, mount := range allCgroups {
+		// BEFORE kubelet used a random mount point per cgroups subsystem;
+		// NOW    more deterministic: kubelet use mount point with shortest path;
+		// FUTURE is bright with clear expectation determined in doc.
+		// ref. issue: https://github.com/kubernetes/kubernetes/issues/95488
+
 		for _, subsystem := range mount.Subsystems {
-			mountPoints[subsystem] = mount.Mountpoint
+			previous := mountPoints[subsystem]
+			if previous == "" || len(mount.Mountpoint) < len(previous) {
+				mountPoints[subsystem] = mount.Mountpoint
+			}
 		}
 	}
 	return &CgroupSubsystems{
@@ -208,13 +248,12 @@ func getCgroupSubsystemsV1() (*CgroupSubsystems, error) {
 
 // getCgroupSubsystemsV2 returns information about the enabled cgroup v2 subsystems
 func getCgroupSubsystemsV2() (*CgroupSubsystems, error) {
-	content, err := ioutil.ReadFile(filepath.Join(util.CgroupRoot, "cgroup.controllers"))
+	controllers, err := libcontainercgroups.GetAllSubsystems()
 	if err != nil {
 		return nil, err
 	}
 
 	mounts := []libcontainercgroups.Mount{}
-	controllers := strings.Fields(string(content))
 	mountPoints := make(map[string]string, len(controllers))
 	for _, controller := range controllers {
 		mountPoints[controller] = util.CgroupRoot

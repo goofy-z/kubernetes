@@ -19,12 +19,14 @@ package apps
 import (
 	"context"
 	"fmt"
+	"strconv"
 	"time"
 
 	batchv1 "k8s.io/api/batch/v1"
 	v1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/util/sets"
 	"k8s.io/apimachinery/pkg/util/wait"
 	clientset "k8s.io/client-go/kubernetes"
 	batchinternal "k8s.io/kubernetes/pkg/apis/batch"
@@ -33,6 +35,7 @@ import (
 	e2enode "k8s.io/kubernetes/test/e2e/framework/node"
 	e2epod "k8s.io/kubernetes/test/e2e/framework/pod"
 	e2eresource "k8s.io/kubernetes/test/e2e/framework/resource"
+	"k8s.io/utils/pointer"
 
 	"github.com/onsi/ginkgo"
 	"github.com/onsi/gomega"
@@ -67,6 +70,113 @@ var _ = SIGDescribe("Job", func() {
 		framework.ExpectEqual(successes, completions, "epected %d successful job pods, but got  %d", completions, successes)
 	})
 
+	ginkgo.It("should not create pods when created in suspend state", func() {
+		ginkgo.By("Creating a job with suspend=true")
+		job := e2ejob.NewTestJob("succeed", "suspend-true-to-false", v1.RestartPolicyNever, parallelism, completions, nil, backoffLimit)
+		job.Spec.Suspend = pointer.BoolPtr(true)
+		job, err := e2ejob.CreateJob(f.ClientSet, f.Namespace.Name, job)
+		framework.ExpectNoError(err, "failed to create job in namespace: %s", f.Namespace.Name)
+
+		ginkgo.By("Ensuring pods aren't created for job")
+		framework.ExpectEqual(wait.Poll(framework.Poll, wait.ForeverTestTimeout, func() (bool, error) {
+			pods, err := e2ejob.GetJobPods(f.ClientSet, f.Namespace.Name, job.Name)
+			if err != nil {
+				return false, err
+			}
+			return len(pods.Items) > 0, nil
+		}), wait.ErrWaitTimeout)
+
+		ginkgo.By("Checking Job status to observe Suspended state")
+		job, err = e2ejob.GetJob(f.ClientSet, f.Namespace.Name, job.Name)
+		framework.ExpectNoError(err, "failed to retrieve latest job object")
+		exists := false
+		for _, c := range job.Status.Conditions {
+			if c.Type == batchv1.JobSuspended {
+				exists = true
+				break
+			}
+		}
+		framework.ExpectEqual(exists, true)
+
+		ginkgo.By("Updating the job with suspend=false")
+		job.Spec.Suspend = pointer.BoolPtr(false)
+		job, err = e2ejob.UpdateJob(f.ClientSet, f.Namespace.Name, job)
+		framework.ExpectNoError(err, "failed to update job in namespace: %s", f.Namespace.Name)
+
+		ginkgo.By("Waiting for job to complete")
+		err = e2ejob.WaitForJobComplete(f.ClientSet, f.Namespace.Name, job.Name, completions)
+		framework.ExpectNoError(err, "failed to ensure job completion in namespace: %s", f.Namespace.Name)
+	})
+
+	ginkgo.It("should delete pods when suspended", func() {
+		ginkgo.By("Creating a job with suspend=false")
+		job := e2ejob.NewTestJob("notTerminate", "suspend-false-to-true", v1.RestartPolicyNever, parallelism, completions, nil, backoffLimit)
+		job.Spec.Suspend = pointer.BoolPtr(false)
+		job, err := e2ejob.CreateJob(f.ClientSet, f.Namespace.Name, job)
+		framework.ExpectNoError(err, "failed to create job in namespace: %s", f.Namespace.Name)
+
+		ginkgo.By("Ensure pods equal to paralellism count is attached to the job")
+		err = e2ejob.WaitForAllJobPodsRunning(f.ClientSet, f.Namespace.Name, job.Name, parallelism)
+		framework.ExpectNoError(err, "failed to ensure number of pods associated with job %s is equal to parallelism count in namespace: %s", job.Name, f.Namespace.Name)
+
+		ginkgo.By("Updating the job with suspend=true")
+		job, err = e2ejob.GetJob(f.ClientSet, f.Namespace.Name, job.Name)
+		framework.ExpectNoError(err, "failed to retrieve latest job object")
+		job.Spec.Suspend = pointer.BoolPtr(true)
+		job, err = e2ejob.UpdateJob(f.ClientSet, f.Namespace.Name, job)
+		framework.ExpectNoError(err, "failed to update job in namespace: %s", f.Namespace.Name)
+
+		ginkgo.By("Ensuring pods are deleted")
+		err = e2ejob.WaitForAllJobPodsGone(f.ClientSet, f.Namespace.Name, job.Name)
+		framework.ExpectNoError(err, "failed to ensure pods are deleted after suspend=true")
+
+		ginkgo.By("Checking Job status to observe Suspended state")
+		job, err = e2ejob.GetJob(f.ClientSet, f.Namespace.Name, job.Name)
+		framework.ExpectNoError(err, "failed to retrieve latest job object")
+		exists := false
+		for _, c := range job.Status.Conditions {
+			if c.Type == batchv1.JobSuspended {
+				exists = true
+				break
+			}
+		}
+		framework.ExpectEqual(exists, true)
+	})
+
+	/*
+		Testcase: Ensure Pods of an Indexed Job get a unique index.
+		Description: Create an Indexed Job, wait for completion, capture the output of the pods and verify that they contain the completion index.
+	*/
+	ginkgo.It("should create pods for an Indexed job with completion indexes and specified hostname", func() {
+		ginkgo.By("Creating Indexed job")
+		job := e2ejob.NewTestJob("succeed", "indexed-job", v1.RestartPolicyNever, parallelism, completions, nil, backoffLimit)
+		mode := batchv1.IndexedCompletion
+		job.Spec.CompletionMode = &mode
+		job, err := e2ejob.CreateJob(f.ClientSet, f.Namespace.Name, job)
+		framework.ExpectNoError(err, "failed to create indexed job in namespace %s", f.Namespace.Name)
+
+		ginkgo.By("Ensuring job reaches completions")
+		err = e2ejob.WaitForJobComplete(f.ClientSet, f.Namespace.Name, job.Name, completions)
+		framework.ExpectNoError(err, "failed to ensure job completion in namespace: %s", f.Namespace.Name)
+
+		ginkgo.By("Ensuring pods with index for job exist")
+		pods, err := e2ejob.GetJobPods(f.ClientSet, f.Namespace.Name, job.Name)
+		framework.ExpectNoError(err, "failed to get pod list for job in namespace: %s", f.Namespace.Name)
+		succeededIndexes := sets.NewInt()
+		for _, pod := range pods.Items {
+			if pod.Status.Phase == v1.PodSucceeded && pod.Annotations != nil {
+				ix, err := strconv.Atoi(pod.Annotations[batchv1.JobCompletionIndexAnnotation])
+				framework.ExpectNoError(err, "failed obtaining completion index from pod in namespace: %s", f.Namespace.Name)
+				succeededIndexes.Insert(ix)
+				expectedName := fmt.Sprintf("%s-%d", job.Name, ix)
+				framework.ExpectEqual(pod.Spec.Hostname, expectedName, "expected completed pod with hostname %s, but got %s", expectedName, pod.Spec.Hostname)
+			}
+		}
+		gotIndexes := succeededIndexes.List()
+		wantIndexes := []int{0, 1, 2, 3}
+		framework.ExpectEqual(gotIndexes, wantIndexes, "expected completed indexes %s, but got %s", wantIndexes, gotIndexes)
+	})
+
 	/*
 		Testcase: Ensure that the pods associated with the job are removed once the job is deleted
 		Description: Create a job and ensure the associated pod count is equal to paralellism count. Delete the
@@ -92,7 +202,7 @@ var _ = SIGDescribe("Job", func() {
 	})
 
 	/*
-		Release : v1.16
+		Release: v1.16
 		Testname: Jobs, completion after task failure
 		Description: Explicitly cause the tasks to fail once initially. After restarting, the Job MUST
 		execute to completion.
@@ -143,12 +253,12 @@ var _ = SIGDescribe("Job", func() {
 		job, err := e2ejob.CreateJob(f.ClientSet, f.Namespace.Name, job)
 		framework.ExpectNoError(err, "failed to create job in namespace: %s", f.Namespace.Name)
 		ginkgo.By("Ensuring job past active deadline")
-		err = waitForJobFailure(f.ClientSet, f.Namespace.Name, job.Name, time.Duration(activeDeadlineSeconds+10)*time.Second, "DeadlineExceeded")
+		err = waitForJobFailure(f.ClientSet, f.Namespace.Name, job.Name, time.Duration(activeDeadlineSeconds+15)*time.Second, "DeadlineExceeded")
 		framework.ExpectNoError(err, "failed to ensure job past active deadline in namespace: %s", f.Namespace.Name)
 	})
 
 	/*
-		Release : v1.15
+		Release: v1.15
 		Testname: Jobs, active pods, graceful termination
 		Description: Create a job. Ensure the active pods reflect paralellism in the namespace and delete the job. Job MUST be deleted successfully.
 	*/
@@ -172,7 +282,7 @@ var _ = SIGDescribe("Job", func() {
 	})
 
 	/*
-		Release : v1.16
+		Release: v1.16
 		Testname: Jobs, orphan pods, re-adoption
 		Description: Create a parallel job. The number of Pods MUST equal the level of parallelism.
 		Orphan a Pod by modifying its owner reference. The Job MUST re-adopt the orphan pod.
@@ -246,13 +356,7 @@ var _ = SIGDescribe("Job", func() {
 		ginkgo.By(fmt.Sprintf("Checking that %d pod created and status is failed", backoff+1))
 		pods, err := e2ejob.GetJobPods(f.ClientSet, f.Namespace.Name, job.Name)
 		framework.ExpectNoError(err, "failed to get PodList for job %s in namespace: %s", job.Name, f.Namespace.Name)
-		// gomega.Expect(pods.Items).To(gomega.HaveLen(backoff + 1))
-		// due to NumRequeus not being stable enough, especially with failed status
-		// updates we need to allow more than backoff+1
-		// TODO revert this back to above when https://github.com/kubernetes/kubernetes/issues/64787 gets fixed
-		if len(pods.Items) < backoff+1 {
-			framework.Failf("Not enough pod created expected at least %d, got %#v", backoff+1, pods.Items)
-		}
+		gomega.Expect(pods.Items).To(gomega.HaveLen(backoff + 1))
 		for _, pod := range pods.Items {
 			framework.ExpectEqual(pod.Status.Phase, v1.PodFailed)
 		}

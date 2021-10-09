@@ -5,11 +5,16 @@ approvers:
 - derekwaynecarr
 - ConnorDoyle
 - klueska
+- sjenning
+- mrunalp
+- ehashman
+- SergeyKanzhelev
 emeritus_approvers:
 - balajismaniam
 - Random-Liu
 - vishh
 - yujuhong
+- dashpole
 reviewers:
 - bart0sh
 - bsdnet

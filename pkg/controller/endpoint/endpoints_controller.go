@@ -19,7 +19,7 @@ package endpoint
 import (
 	"context"
 	"fmt"
-	"reflect"
+	"math"
 	"strconv"
 	"time"
 
@@ -30,7 +30,6 @@ import (
 	"k8s.io/apimachinery/pkg/labels"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
 	"k8s.io/apimachinery/pkg/util/wait"
-	utilfeature "k8s.io/apiserver/pkg/util/feature"
 	coreinformers "k8s.io/client-go/informers/core/v1"
 	clientset "k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/kubernetes/scheme"
@@ -48,7 +47,6 @@ import (
 	helper "k8s.io/kubernetes/pkg/apis/core/v1/helper"
 	"k8s.io/kubernetes/pkg/controller"
 	endpointutil "k8s.io/kubernetes/pkg/controller/util/endpoint"
-	"k8s.io/kubernetes/pkg/features"
 	utillabels "k8s.io/kubernetes/pkg/util/labels"
 	utilnet "k8s.io/utils/net"
 )
@@ -60,6 +58,11 @@ const (
 	//
 	// 5ms, 10ms, 20ms, 40ms, 80ms, 160ms, 320ms, 640ms, 1.3s, 2.6s, 5.1s, 10.2s, 20.4s, 41s, 82s
 	maxRetries = 15
+
+	// maxCapacity represents the maximum number of addresses that should be
+	// stored in an Endpoints resource. In a future release, this controller
+	// may truncate endpoints exceeding this length.
+	maxCapacity = 1000
 
 	// TolerateUnreadyEndpointsAnnotation is an annotation on the Service denoting if the endpoints
 	// controller should go ahead and create endpoints for unready pods. This annotation is
@@ -74,11 +77,16 @@ const (
 	// This field is deprecated. v1.Service.PublishNotReadyAddresses will replace it
 	// subsequent releases.  It will be removed no sooner than 1.13.
 	TolerateUnreadyEndpointsAnnotation = "service.alpha.kubernetes.io/tolerate-unready-endpoints"
+
+	// truncated is a possible value for `endpoints.kubernetes.io/over-capacity` annotation on an
+	// endpoint resource and indicates that the number of endpoints have been truncated to
+	// maxCapacity
+	truncated = "truncated"
 )
 
-// NewEndpointController returns a new *EndpointController.
+// NewEndpointController returns a new *Controller.
 func NewEndpointController(podInformer coreinformers.PodInformer, serviceInformer coreinformers.ServiceInformer,
-	endpointsInformer coreinformers.EndpointsInformer, client clientset.Interface, endpointUpdatesBatchPeriod time.Duration) *EndpointController {
+	endpointsInformer coreinformers.EndpointsInformer, client clientset.Interface, endpointUpdatesBatchPeriod time.Duration) *Controller {
 	broadcaster := record.NewBroadcaster()
 	broadcaster.StartStructuredLogging(0)
 	broadcaster.StartRecordingToSink(&v1core.EventSinkImpl{Interface: client.CoreV1().Events("")})
@@ -87,7 +95,7 @@ func NewEndpointController(podInformer coreinformers.PodInformer, serviceInforme
 	if client != nil && client.CoreV1().RESTClient().GetRateLimiter() != nil {
 		ratelimiter.RegisterMetricAndTrackRateLimiterUsage("endpoint_controller", client.CoreV1().RESTClient().GetRateLimiter())
 	}
-	e := &EndpointController{
+	e := &Controller{
 		client:           client,
 		queue:            workqueue.NewNamedRateLimitingQueue(workqueue.DefaultControllerRateLimiter(), "endpoint"),
 		workerLoopPeriod: time.Second,
@@ -111,6 +119,9 @@ func NewEndpointController(podInformer coreinformers.PodInformer, serviceInforme
 	e.podLister = podInformer.Lister()
 	e.podsSynced = podInformer.Informer().HasSynced
 
+	endpointsInformer.Informer().AddEventHandler(cache.ResourceEventHandlerFuncs{
+		DeleteFunc: e.onEndpointsDelete,
+	})
 	e.endpointsLister = endpointsInformer.Lister()
 	e.endpointsSynced = endpointsInformer.Informer().HasSynced
 
@@ -125,8 +136,8 @@ func NewEndpointController(podInformer coreinformers.PodInformer, serviceInforme
 	return e
 }
 
-// EndpointController manages selector-based service endpoints.
-type EndpointController struct {
+// Controller manages selector-based service endpoints.
+type Controller struct {
 	client           clientset.Interface
 	eventBroadcaster record.EventBroadcaster
 	eventRecorder    record.EventRecorder
@@ -175,7 +186,7 @@ type EndpointController struct {
 
 // Run will not return until stopCh is closed. workers determines how many
 // endpoints will be handled in parallel.
-func (e *EndpointController) Run(workers int, stopCh <-chan struct{}) {
+func (e *Controller) Run(workers int, stopCh <-chan struct{}) {
 	defer utilruntime.HandleCrash()
 	defer e.queue.ShutDown()
 
@@ -200,7 +211,7 @@ func (e *EndpointController) Run(workers int, stopCh <-chan struct{}) {
 
 // When a pod is added, figure out what services it will be a member of and
 // enqueue them. obj must have *v1.Pod type.
-func (e *EndpointController) addPod(obj interface{}) {
+func (e *Controller) addPod(obj interface{}) {
 	pod := obj.(*v1.Pod)
 	services, err := e.serviceSelectorCache.GetPodServiceMemberships(e.serviceLister, pod)
 	if err != nil {
@@ -213,39 +224,50 @@ func (e *EndpointController) addPod(obj interface{}) {
 }
 
 func podToEndpointAddressForService(svc *v1.Service, pod *v1.Pod) (*v1.EndpointAddress, error) {
-	if !utilfeature.DefaultFeatureGate.Enabled(features.IPv6DualStack) {
-		return podToEndpointAddress(pod), nil
-	}
+	var endpointIP string
+	ipFamily := v1.IPv4Protocol
 
-	// api-server service controller ensured that the service got the correct IP Family
-	// according to user setup, here we only need to match EndPoint IPs' family to service
-	// actual IP family. as in, we don't need to check service.IPFamily
+	if len(svc.Spec.IPFamilies) > 0 {
+		// controller is connected to an api-server that correctly sets IPFamilies
+		ipFamily = svc.Spec.IPFamilies[0] // this works for headful and headless
+	} else {
+		// controller is connected to an api server that does not correctly
+		// set IPFamilies (e.g. old api-server during an upgrade)
+		// TODO (khenidak): remove by when the possibility of upgrading
+		// from a cluster that does not support dual stack is nil
+		if len(svc.Spec.ClusterIP) > 0 && svc.Spec.ClusterIP != v1.ClusterIPNone {
+			// headful service. detect via service clusterIP
+			if utilnet.IsIPv6String(svc.Spec.ClusterIP) {
+				ipFamily = v1.IPv6Protocol
+			}
+		} else {
+			// Since this is a headless service we use podIP to identify the family.
+			// This assumes that status.PodIP is assigned correctly (follows pod cidr and
+			// pod cidr list order is same as service cidr list order). The expectation is
+			// this is *most probably* the case.
 
-	ipv6ClusterIP := utilnet.IsIPv6String(svc.Spec.ClusterIP)
-	for _, podIP := range pod.Status.PodIPs {
-		ipv6PodIP := utilnet.IsIPv6String(podIP.IP)
-		// same family?
-		// TODO (khenidak) when we remove the max of 2 PodIP limit from pods
-		// we will have to return multiple endpoint addresses
-		if ipv6ClusterIP == ipv6PodIP {
-			return &v1.EndpointAddress{
-				IP:       podIP.IP,
-				NodeName: &pod.Spec.NodeName,
-				TargetRef: &v1.ObjectReference{
-					Kind:            "Pod",
-					Namespace:       pod.ObjectMeta.Namespace,
-					Name:            pod.ObjectMeta.Name,
-					UID:             pod.ObjectMeta.UID,
-					ResourceVersion: pod.ObjectMeta.ResourceVersion,
-				}}, nil
+			// if the family was incorrectly identified then this will be corrected once the
+			// the upgrade is completed (controller connects to api-server that correctly defaults services)
+			if utilnet.IsIPv6String(pod.Status.PodIP) {
+				ipFamily = v1.IPv6Protocol
+			}
 		}
 	}
-	return nil, fmt.Errorf("failed to find a matching endpoint for service %v", svc.Name)
-}
 
-func podToEndpointAddress(pod *v1.Pod) *v1.EndpointAddress {
+	// find an ip that matches the family
+	for _, podIP := range pod.Status.PodIPs {
+		if (ipFamily == v1.IPv6Protocol) == utilnet.IsIPv6String(podIP.IP) {
+			endpointIP = podIP.IP
+			break
+		}
+	}
+
+	if endpointIP == "" {
+		return nil, fmt.Errorf("failed to find a matching endpoint for service %v", svc.Name)
+	}
+
 	return &v1.EndpointAddress{
-		IP:       pod.Status.PodIP,
+		IP:       endpointIP,
 		NodeName: &pod.Spec.NodeName,
 		TargetRef: &v1.ObjectReference{
 			Kind:            "Pod",
@@ -253,24 +275,15 @@ func podToEndpointAddress(pod *v1.Pod) *v1.EndpointAddress {
 			Name:            pod.ObjectMeta.Name,
 			UID:             pod.ObjectMeta.UID,
 			ResourceVersion: pod.ObjectMeta.ResourceVersion,
-		}}
-}
-
-func endpointChanged(pod1, pod2 *v1.Pod) bool {
-	endpointAddress1 := podToEndpointAddress(pod1)
-	endpointAddress2 := podToEndpointAddress(pod2)
-
-	endpointAddress1.TargetRef.ResourceVersion = ""
-	endpointAddress2.TargetRef.ResourceVersion = ""
-
-	return !reflect.DeepEqual(endpointAddress1, endpointAddress2)
+		},
+	}, nil
 }
 
 // When a pod is updated, figure out what services it used to be a member of
 // and what services it will be a member of, and enqueue the union of these.
 // old and cur must be *v1.Pod types.
-func (e *EndpointController) updatePod(old, cur interface{}) {
-	services := endpointutil.GetServicesToUpdateOnPodChange(e.serviceLister, e.serviceSelectorCache, old, cur, endpointChanged)
+func (e *Controller) updatePod(old, cur interface{}) {
+	services := endpointutil.GetServicesToUpdateOnPodChange(e.serviceLister, e.serviceSelectorCache, old, cur)
 	for key := range services {
 		e.queue.AddAfter(key, e.endpointUpdatesBatchPeriod)
 	}
@@ -278,7 +291,7 @@ func (e *EndpointController) updatePod(old, cur interface{}) {
 
 // When a pod is deleted, enqueue the services the pod used to be a member of.
 // obj could be an *v1.Pod, or a DeletionFinalStateUnknown marker item.
-func (e *EndpointController) deletePod(obj interface{}) {
+func (e *Controller) deletePod(obj interface{}) {
 	pod := endpointutil.GetPodFromDeleteAction(obj)
 	if pod != nil {
 		e.addPod(pod)
@@ -286,7 +299,7 @@ func (e *EndpointController) deletePod(obj interface{}) {
 }
 
 // onServiceUpdate updates the Service Selector in the cache and queues the Service for processing.
-func (e *EndpointController) onServiceUpdate(obj interface{}) {
+func (e *Controller) onServiceUpdate(obj interface{}) {
 	key, err := controller.KeyFunc(obj)
 	if err != nil {
 		utilruntime.HandleError(fmt.Errorf("Couldn't get key for object %+v: %v", obj, err))
@@ -298,7 +311,7 @@ func (e *EndpointController) onServiceUpdate(obj interface{}) {
 }
 
 // onServiceDelete removes the Service Selector from the cache and queues the Service for processing.
-func (e *EndpointController) onServiceDelete(obj interface{}) {
+func (e *Controller) onServiceDelete(obj interface{}) {
 	key, err := controller.KeyFunc(obj)
 	if err != nil {
 		utilruntime.HandleError(fmt.Errorf("Couldn't get key for object %+v: %v", obj, err))
@@ -309,16 +322,25 @@ func (e *EndpointController) onServiceDelete(obj interface{}) {
 	e.queue.Add(key)
 }
 
+func (e *Controller) onEndpointsDelete(obj interface{}) {
+	key, err := controller.KeyFunc(obj)
+	if err != nil {
+		utilruntime.HandleError(fmt.Errorf("Couldn't get key for object %+v: %v", obj, err))
+		return
+	}
+	e.queue.Add(key)
+}
+
 // worker runs a worker thread that just dequeues items, processes them, and
 // marks them done. You may run as many of these in parallel as you wish; the
 // workqueue guarantees that they will not end up processing the same service
 // at the same time.
-func (e *EndpointController) worker() {
+func (e *Controller) worker() {
 	for e.processNextWorkItem() {
 	}
 }
 
-func (e *EndpointController) processNextWorkItem() bool {
+func (e *Controller) processNextWorkItem() bool {
 	eKey, quit := e.queue.Get()
 	if quit {
 		return false
@@ -331,7 +353,7 @@ func (e *EndpointController) processNextWorkItem() bool {
 	return true
 }
 
-func (e *EndpointController) handleErr(err error, key interface{}) {
+func (e *Controller) handleErr(err error, key interface{}) {
 	if err == nil {
 		e.queue.Forget(key)
 		return
@@ -353,7 +375,7 @@ func (e *EndpointController) handleErr(err error, key interface{}) {
 	utilruntime.HandleError(err)
 }
 
-func (e *EndpointController) syncService(key string) error {
+func (e *Controller) syncService(key string) error {
 	startTime := time.Now()
 	defer func() {
 		klog.V(4).Infof("Finished syncing service %q endpoints. (%v)", key, time.Since(startTime))
@@ -482,9 +504,19 @@ func (e *EndpointController) syncService(key string) error {
 
 	createEndpoints := len(currentEndpoints.ResourceVersion) == 0
 
+	// Compare the sorted subsets and labels
+	// Remove the HeadlessService label from the endpoints if it exists,
+	// as this won't be set on the service itself
+	// and will cause a false negative in this diff check.
+	// But first check if it has that label to avoid expensive copies.
+	compareLabels := currentEndpoints.Labels
+	if _, ok := currentEndpoints.Labels[v1.IsHeadlessService]; ok {
+		compareLabels = utillabels.CloneAndRemoveLabel(currentEndpoints.Labels, v1.IsHeadlessService)
+	}
 	if !createEndpoints &&
 		apiequality.Semantic.DeepEqual(currentEndpoints.Subsets, subsets) &&
-		apiequality.Semantic.DeepEqual(currentEndpoints.Labels, service.Labels) {
+		apiequality.Semantic.DeepEqual(compareLabels, service.Labels) &&
+		capacityAnnotationSetCorrectly(currentEndpoints.Annotations, currentEndpoints.Subsets) {
 		klog.V(5).Infof("endpoints are equal for %s/%s, skipping update", service.Namespace, service.Name)
 		return nil
 	}
@@ -497,9 +529,15 @@ func (e *EndpointController) syncService(key string) error {
 
 	if !endpointsLastChangeTriggerTime.IsZero() {
 		newEndpoints.Annotations[v1.EndpointsLastChangeTriggerTime] =
-			endpointsLastChangeTriggerTime.Format(time.RFC3339Nano)
+			endpointsLastChangeTriggerTime.UTC().Format(time.RFC3339Nano)
 	} else { // No new trigger time, clear the annotation.
 		delete(newEndpoints.Annotations, v1.EndpointsLastChangeTriggerTime)
+	}
+
+	if truncateEndpoints(newEndpoints) {
+		newEndpoints.Annotations[v1.EndpointsOverCapacity] = truncated
+	} else {
+		delete(newEndpoints.Annotations, v1.EndpointsOverCapacity)
 	}
 
 	if newEndpoints.Labels == nil {
@@ -551,7 +589,7 @@ func (e *EndpointController) syncService(key string) error {
 // do this once on startup, because in steady-state these are detected (but
 // some stragglers could have been left behind if the endpoint controller
 // reboots).
-func (e *EndpointController) checkLeftoverEndpoints() {
+func (e *Controller) checkLeftoverEndpoints() {
 	list, err := e.endpointsLister.List(labels.Everything())
 	if err != nil {
 		utilruntime.HandleError(fmt.Errorf("Unable to list endpoints (%v); orphaned endpoints will not be cleaned up. (They're pretty harmless, but you can restart this component if you want another attempt made.)", err))
@@ -613,12 +651,93 @@ func shouldPodBeInEndpoints(pod *v1.Pod) bool {
 
 func endpointPortFromServicePort(servicePort *v1.ServicePort, portNum int) *v1.EndpointPort {
 	epp := &v1.EndpointPort{
-		Name:     servicePort.Name,
-		Port:     int32(portNum),
-		Protocol: servicePort.Protocol,
-	}
-	if utilfeature.DefaultFeatureGate.Enabled(features.ServiceAppProtocol) {
-		epp.AppProtocol = servicePort.AppProtocol
+		Name:        servicePort.Name,
+		Port:        int32(portNum),
+		Protocol:    servicePort.Protocol,
+		AppProtocol: servicePort.AppProtocol,
 	}
 	return epp
+}
+
+// capacityAnnotationSetCorrectly returns false if number of endpoints is greater than maxCapacity or
+// returns true if underCapacity and the annotation is not set.
+func capacityAnnotationSetCorrectly(annotations map[string]string, subsets []v1.EndpointSubset) bool {
+	numEndpoints := 0
+	for _, subset := range subsets {
+		numEndpoints += len(subset.Addresses) + len(subset.NotReadyAddresses)
+	}
+	if numEndpoints > maxCapacity {
+		// If subsets are over capacity, they must be truncated so consider
+		// the annotation as not set correctly
+		return false
+	}
+	_, ok := annotations[v1.EndpointsOverCapacity]
+	return !ok
+}
+
+// truncateEndpoints by best effort will distribute the endpoints over the subsets based on the proportion
+// of endpoints per subset and will prioritize Ready Endpoints over NotReady Endpoints.
+func truncateEndpoints(endpoints *v1.Endpoints) bool {
+	totalReady := 0
+	totalNotReady := 0
+	for _, subset := range endpoints.Subsets {
+		totalReady += len(subset.Addresses)
+		totalNotReady += len(subset.NotReadyAddresses)
+	}
+
+	if totalReady+totalNotReady <= maxCapacity {
+		return false
+	}
+
+	truncateReady := false
+	max := maxCapacity - totalReady
+	numTotal := totalNotReady
+	if totalReady > maxCapacity {
+		truncateReady = true
+		max = maxCapacity
+		numTotal = totalReady
+	}
+	canBeAdded := max
+
+	for i := range endpoints.Subsets {
+		subset := endpoints.Subsets[i]
+		numInSubset := len(subset.Addresses)
+		if !truncateReady {
+			numInSubset = len(subset.NotReadyAddresses)
+		}
+
+		// The number of endpoints per subset will be based on the propotion of endpoints
+		// in this subset versus the total number of endpoints. The proportion of endpoints
+		// will be rounded up which most likely will lead to the last subset having less
+		// endpoints than the expected proportion.
+		toBeAdded := int(math.Ceil((float64(numInSubset) / float64(numTotal)) * float64(max)))
+		// If there is not enough endpoints for the last subset, ensure only the number up
+		// to the capacity are added
+		if toBeAdded > canBeAdded {
+			toBeAdded = canBeAdded
+		}
+
+		if truncateReady {
+			// Truncate ready Addresses to allocated proportion and truncate all not ready
+			// addresses
+			subset.Addresses = addressSubset(subset.Addresses, toBeAdded)
+			subset.NotReadyAddresses = []v1.EndpointAddress{}
+			canBeAdded -= len(subset.Addresses)
+		} else {
+			// Only truncate the not ready addresses
+			subset.NotReadyAddresses = addressSubset(subset.NotReadyAddresses, toBeAdded)
+			canBeAdded -= len(subset.NotReadyAddresses)
+		}
+		endpoints.Subsets[i] = subset
+	}
+	return true
+}
+
+// addressSubset takes a list of addresses and returns a subset if the length is greater
+// than the maxNum. If less than the maxNum, the entire list is returned.
+func addressSubset(addresses []v1.EndpointAddress, maxNum int) []v1.EndpointAddress {
+	if len(addresses) <= maxNum {
+		return addresses
+	}
+	return addresses[0:maxNum]
 }

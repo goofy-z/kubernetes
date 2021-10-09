@@ -18,6 +18,7 @@ package framework
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"regexp"
 	"sync"
@@ -27,7 +28,9 @@ import (
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
+	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/sets"
+	"k8s.io/apimachinery/pkg/util/strategicpatch"
 	"k8s.io/apimachinery/pkg/util/wait"
 	"k8s.io/client-go/kubernetes/scheme"
 	v1core "k8s.io/client-go/kubernetes/typed/core/v1"
@@ -37,6 +40,7 @@ import (
 	"github.com/onsi/gomega"
 
 	// TODO: Remove the following imports (ref: https://github.com/kubernetes/kubernetes/issues/81245)
+	"k8s.io/kubernetes/pkg/kubelet/util/format"
 	e2epod "k8s.io/kubernetes/test/e2e/framework/pod"
 )
 
@@ -57,10 +61,10 @@ const (
 	forbiddenReason = "SysctlForbidden"
 )
 
-// ImageWhiteList is the images used in the current test suite. It should be initialized in test suite and
-// the images in the white list should be pre-pulled in the test suite.  Currently, this is only used by
+// ImagePrePullList is the images used in the current test suite. It should be initialized in test suite and
+// the images in the list should be pre-pulled in the test suite.  Currently, this is only used by
 // node e2e test.
-var ImageWhiteList sets.String
+var ImagePrePullList sets.String
 
 // PodClient is a convenience method for getting a pod client interface in the framework's namespace,
 // possibly applying test-suite specific transformations to the pod spec, e.g. for
@@ -96,12 +100,12 @@ func (c *PodClient) Create(pod *v1.Pod) *v1.Pod {
 	return p
 }
 
-// CreateSync creates a new pod according to the framework specifications, and wait for it to start.
+// CreateSync creates a new pod according to the framework specifications, and wait for it to start and be running and ready.
 func (c *PodClient) CreateSync(pod *v1.Pod) *v1.Pod {
 	namespace := c.f.Namespace.Name
 	p := c.Create(pod)
-	ExpectNoError(e2epod.WaitForPodNameRunningInNamespace(c.f.ClientSet, p.Name, namespace))
-	// Get the newest pod after it becomes running, some status may change after pod created, such as pod ip.
+	ExpectNoError(e2epod.WaitTimeoutForPodReadyInNamespace(c.f.ClientSet, p.Name, namespace, PodStartTimeout))
+	// Get the newest pod after it becomes running and ready, some status may change after pod created, such as pod ip.
 	p, err := c.Get(context.TODO(), p.Name, metav1.GetOptions{})
 	ExpectNoError(err)
 	return p
@@ -146,6 +150,27 @@ func (c *PodClient) Update(name string, updateFn func(pod *v1.Pod)) {
 	}))
 }
 
+// AddEphemeralContainerSync adds an EphemeralContainer to a pod and waits for it to be running.
+func (c *PodClient) AddEphemeralContainerSync(pod *v1.Pod, ec *v1.EphemeralContainer, timeout time.Duration) {
+	namespace := c.f.Namespace.Name
+
+	podJS, err := json.Marshal(pod)
+	ExpectNoError(err, "error creating JSON for pod %q", format.Pod(pod))
+
+	ecPod := pod.DeepCopy()
+	ecPod.Spec.EphemeralContainers = append(ecPod.Spec.EphemeralContainers, *ec)
+	ecJS, err := json.Marshal(ecPod)
+	ExpectNoError(err, "error creating JSON for pod with ephemeral container %q", format.Pod(pod))
+
+	patch, err := strategicpatch.CreateTwoWayMergePatch(podJS, ecJS, pod)
+	ExpectNoError(err, "error creating patch to add ephemeral container %q", format.Pod(pod))
+
+	_, err = c.Patch(context.TODO(), pod.Name, types.StrategicMergePatchType, patch, metav1.PatchOptions{}, "ephemeralcontainers")
+	ExpectNoError(err, "Failed to patch ephemeral containers in pod %q", format.Pod(pod))
+
+	ExpectNoError(e2epod.WaitForContainerRunning(c.f.ClientSet, namespace, pod.Name, ec.Name, timeout))
+}
+
 // DeleteSync deletes the pod and wait for the pod to disappear for `timeout`. If the pod doesn't
 // disappear before the timeout, it will fail the test.
 func (c *PodClient) DeleteSync(name string, options metav1.DeleteOptions, timeout time.Duration) {
@@ -181,13 +206,13 @@ func (c *PodClient) mungeSpec(pod *v1.Pod) {
 		c := &pod.Spec.Containers[i]
 		if c.ImagePullPolicy == v1.PullAlways {
 			// If the image pull policy is PullAlways, the image doesn't need to be in
-			// the white list or pre-pulled, because the image is expected to be pulled
+			// the allow list or pre-pulled, because the image is expected to be pulled
 			// in the test anyway.
 			continue
 		}
 		// If the image policy is not PullAlways, the image must be in the pre-pull list and
 		// pre-pulled.
-		gomega.Expect(ImageWhiteList.Has(c.Image)).To(gomega.BeTrue(), "Image %q is not in the white list, consider adding it to CommonImageWhiteList in test/e2e/common/util.go or NodePrePullImageList in test/e2e_node/image_list.go", c.Image)
+		gomega.Expect(ImagePrePullList.Has(c.Image)).To(gomega.BeTrue(), "Image %q is not in the pre-pull list, consider adding it to PrePulledImages in test/e2e/common/util.go or NodePrePullImageList in test/e2e_node/image_list.go", c.Image)
 		// Do not pull images during the tests because the images in pre-pull list should have
 		// been prepulled.
 		c.ImagePullPolicy = v1.PullNever

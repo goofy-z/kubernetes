@@ -120,7 +120,7 @@ func TestTaintBasedEvictions(t *testing.T) {
 	)
 	for i, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			testCtx := testutils.InitTestMaster(t, "taint-based-evictions", admission)
+			testCtx := testutils.InitTestAPIServer(t, "taint-based-evictions", admission)
 
 			// Build clientset and informers for controllers.
 			externalClientset := kubernetes.NewForConfigOrDie(&restclient.Config{
@@ -131,7 +131,7 @@ func TestTaintBasedEvictions(t *testing.T) {
 			podTolerations.SetExternalKubeClientSet(externalClientset)
 			podTolerations.SetExternalKubeInformerFactory(externalInformers)
 
-			testCtx = testutils.InitTestScheduler(t, testCtx, true, nil)
+			testCtx = testutils.InitTestScheduler(t, testCtx)
 			defer testutils.CleanupTest(t, testCtx)
 			cs := testCtx.ClientSet
 			_, err := cs.CoreV1().Namespaces().Create(context.TODO(), testCtx.NS, metav1.CreateOptions{})
@@ -181,7 +181,7 @@ func TestTaintBasedEvictions(t *testing.T) {
 				nodes = append(nodes, &v1.Node{
 					ObjectMeta: metav1.ObjectMeta{
 						Name:   fmt.Sprintf("node-%d", i),
-						Labels: map[string]string{v1.LabelZoneRegion: "region1", v1.LabelZoneFailureDomain: "zone1"},
+						Labels: map[string]string{v1.LabelTopologyRegion: "region1", v1.LabelTopologyZone: "zone1"},
 					},
 					Spec: v1.NodeSpec{},
 					Status: v1.NodeStatus{

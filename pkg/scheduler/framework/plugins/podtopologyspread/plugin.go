@@ -19,38 +19,59 @@ package podtopologyspread
 import (
 	"fmt"
 
+	v1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/client-go/informers"
 	appslisters "k8s.io/client-go/listers/apps/v1"
 	corelisters "k8s.io/client-go/listers/core/v1"
 	"k8s.io/kubernetes/pkg/scheduler/apis/config"
 	"k8s.io/kubernetes/pkg/scheduler/apis/config/validation"
-	framework "k8s.io/kubernetes/pkg/scheduler/framework/v1alpha1"
+	"k8s.io/kubernetes/pkg/scheduler/framework"
+	"k8s.io/kubernetes/pkg/scheduler/framework/plugins/names"
+	"k8s.io/kubernetes/pkg/scheduler/internal/parallelize"
 )
 
 const (
 	// ErrReasonConstraintsNotMatch is used for PodTopologySpread filter error.
 	ErrReasonConstraintsNotMatch = "node(s) didn't match pod topology spread constraints"
+	// ErrReasonNodeLabelNotMatch is used when the node doesn't hold the required label.
+	ErrReasonNodeLabelNotMatch = ErrReasonConstraintsNotMatch + " (missing required label)"
 )
+
+var systemDefaultConstraints = []v1.TopologySpreadConstraint{
+	{
+		TopologyKey:       v1.LabelHostname,
+		WhenUnsatisfiable: v1.ScheduleAnyway,
+		MaxSkew:           3,
+	},
+	{
+		TopologyKey:       v1.LabelTopologyZone,
+		WhenUnsatisfiable: v1.ScheduleAnyway,
+		MaxSkew:           5,
+	},
+}
 
 // PodTopologySpread is a plugin that ensures pod's topologySpreadConstraints is satisfied.
 type PodTopologySpread struct {
-	args             config.PodTopologySpreadArgs
-	sharedLister     framework.SharedLister
-	services         corelisters.ServiceLister
-	replicationCtrls corelisters.ReplicationControllerLister
-	replicaSets      appslisters.ReplicaSetLister
-	statefulSets     appslisters.StatefulSetLister
+	systemDefaulted    bool
+	parallelizer       parallelize.Parallelizer
+	defaultConstraints []v1.TopologySpreadConstraint
+	sharedLister       framework.SharedLister
+	services           corelisters.ServiceLister
+	replicationCtrls   corelisters.ReplicationControllerLister
+	replicaSets        appslisters.ReplicaSetLister
+	statefulSets       appslisters.StatefulSetLister
 }
 
 var _ framework.PreFilterPlugin = &PodTopologySpread{}
 var _ framework.FilterPlugin = &PodTopologySpread{}
 var _ framework.PreScorePlugin = &PodTopologySpread{}
 var _ framework.ScorePlugin = &PodTopologySpread{}
+var _ framework.EnqueueExtensions = &PodTopologySpread{}
 
 const (
 	// Name is the name of the plugin used in the plugin registry and configurations.
-	Name = "PodTopologySpread"
+	Name = names.PodTopologySpread
 )
 
 // Name returns name of the plugin. It is used in logs, etc.
@@ -58,13 +79,8 @@ func (pl *PodTopologySpread) Name() string {
 	return Name
 }
 
-// BuildArgs returns the arguments used to build the plugin.
-func (pl *PodTopologySpread) BuildArgs() interface{} {
-	return pl.args
-}
-
 // New initializes a new plugin and returns it.
-func New(plArgs runtime.Object, h framework.FrameworkHandle) (framework.Plugin, error) {
+func New(plArgs runtime.Object, h framework.Handle) (framework.Plugin, error) {
 	if h.SnapshotSharedLister() == nil {
 		return nil, fmt.Errorf("SnapshotSharedlister is nil")
 	}
@@ -72,14 +88,19 @@ func New(plArgs runtime.Object, h framework.FrameworkHandle) (framework.Plugin, 
 	if err != nil {
 		return nil, err
 	}
-	if err := validation.ValidatePodTopologySpreadArgs(&args); err != nil {
+	if err := validation.ValidatePodTopologySpreadArgs(nil, &args); err != nil {
 		return nil, err
 	}
 	pl := &PodTopologySpread{
-		sharedLister: h.SnapshotSharedLister(),
-		args:         args,
+		parallelizer:       h.Parallelizer(),
+		sharedLister:       h.SnapshotSharedLister(),
+		defaultConstraints: args.DefaultConstraints,
 	}
-	if len(pl.args.DefaultConstraints) != 0 {
+	if args.DefaultingType == config.SystemDefaulting {
+		pl.defaultConstraints = systemDefaultConstraints
+		pl.systemDefaulted = true
+	}
+	if len(pl.defaultConstraints) != 0 {
 		if h.SharedInformerFactory() == nil {
 			return nil, fmt.Errorf("SharedInformerFactory is nil")
 		}
@@ -101,4 +122,22 @@ func (pl *PodTopologySpread) setListers(factory informers.SharedInformerFactory)
 	pl.replicationCtrls = factory.Core().V1().ReplicationControllers().Lister()
 	pl.replicaSets = factory.Apps().V1().ReplicaSets().Lister()
 	pl.statefulSets = factory.Apps().V1().StatefulSets().Lister()
+}
+
+// EventsToRegister returns the possible events that may make a Pod
+// failed by this plugin schedulable.
+func (pl *PodTopologySpread) EventsToRegister() []framework.ClusterEvent {
+	return []framework.ClusterEvent{
+		// All ActionType includes the following events:
+		// - Add. An unschedulable Pod may fail due to violating topology spread constraints,
+		// adding an assigned Pod may make it schedulable.
+		// - Update. Updating on an existing Pod's labels (e.g., removal) may make
+		// an unschedulable Pod schedulable.
+		// - Delete. An unschedulable Pod may fail due to violating an existing Pod's topology spread constraints,
+		// deleting an existing Pod may make it schedulable.
+		{Resource: framework.Pod, ActionType: framework.All},
+		// Node add|delete|updateLabel maybe lead an topology key changed,
+		// and make these pod in scheduling schedulable or unschedulable.
+		{Resource: framework.Node, ActionType: framework.Add | framework.Delete | framework.UpdateNodeLabel},
+	}
 }

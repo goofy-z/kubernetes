@@ -27,11 +27,13 @@ import (
 	"github.com/pkg/errors"
 	"github.com/spf13/cobra"
 	flag "github.com/spf13/pflag"
+
 	"k8s.io/apimachinery/pkg/util/sets"
 	clientset "k8s.io/client-go/kubernetes"
+
 	kubeadmapi "k8s.io/kubernetes/cmd/kubeadm/app/apis/kubeadm"
 	kubeadmscheme "k8s.io/kubernetes/cmd/kubeadm/app/apis/kubeadm/scheme"
-	kubeadmapiv1beta2 "k8s.io/kubernetes/cmd/kubeadm/app/apis/kubeadm/v1beta2"
+	kubeadmapiv1 "k8s.io/kubernetes/cmd/kubeadm/app/apis/kubeadm/v1beta3"
 	"k8s.io/kubernetes/cmd/kubeadm/app/apis/kubeadm/validation"
 	"k8s.io/kubernetes/cmd/kubeadm/app/cmd/options"
 	phases "k8s.io/kubernetes/cmd/kubeadm/app/cmd/phases/init"
@@ -55,6 +57,10 @@ var (
 		  mkdir -p $HOME/.kube
 		  sudo cp -i {{.KubeConfigPath}} $HOME/.kube/config
 		  sudo chown $(id -u):$(id -g) $HOME/.kube/config
+
+		Alternatively, if you are the root user, you can run:
+
+		  export KUBECONFIG=/etc/kubernetes/admin.conf
 
 		You should now deploy a pod network to the cluster.
 		Run "kubectl apply -f [podnetwork].yaml" with one of the options listed at:
@@ -94,11 +100,11 @@ type initOptions struct {
 	featureGatesString      string
 	ignorePreflightErrors   []string
 	bto                     *options.BootstrapTokenOptions
-	externalInitCfg         *kubeadmapiv1beta2.InitConfiguration
-	externalClusterCfg      *kubeadmapiv1beta2.ClusterConfiguration
+	externalInitCfg         *kubeadmapiv1.InitConfiguration
+	externalClusterCfg      *kubeadmapiv1.ClusterConfiguration
 	uploadCerts             bool
 	skipCertificateKeyPrint bool
-	kustomizeDir            string
+	patchesDir              string
 }
 
 // compile-time assert that the local data object satisfies the phases data interface.
@@ -120,13 +126,13 @@ type initData struct {
 	outputWriter            io.Writer
 	uploadCerts             bool
 	skipCertificateKeyPrint bool
-	kustomizeDir            string
+	patchesDir              string
 }
 
-// NewCmdInit returns "kubeadm init" command.
+// newCmdInit returns "kubeadm init" command.
 // NB. initOptions is exposed as parameter for allowing unit testing of
 //     the newInitOptions method, that implements all the command options validation logic
-func NewCmdInit(out io.Writer, initOptions *initOptions) *cobra.Command {
+func newCmdInit(out io.Writer, initOptions *initOptions) *cobra.Command {
 	if initOptions == nil {
 		initOptions = newInitOptions()
 	}
@@ -188,7 +194,15 @@ func NewCmdInit(out io.Writer, initOptions *initOptions) *cobra.Command {
 	// sets the data builder function, that will be used by the runner
 	// both when running the entire workflow or single phases
 	initRunner.SetDataInitializer(func(cmd *cobra.Command, args []string) (workflow.RunData, error) {
-		return newInitData(cmd, args, initOptions, out)
+		data, err := newInitData(cmd, args, initOptions, out)
+		if err != nil {
+			return nil, err
+		}
+		// If the flag for skipping phases was empty, use the values from config
+		if len(initRunner.Options.SkipPhases) == 0 {
+			initRunner.Options.SkipPhases = data.cfg.SkipPhases
+		}
+		return data, nil
 	})
 
 	// binds the Runner to kubeadm init command by altering
@@ -199,7 +213,7 @@ func NewCmdInit(out io.Writer, initOptions *initOptions) *cobra.Command {
 }
 
 // AddInitConfigFlags adds init flags bound to the config to the specified flagset
-func AddInitConfigFlags(flagSet *flag.FlagSet, cfg *kubeadmapiv1beta2.InitConfiguration) {
+func AddInitConfigFlags(flagSet *flag.FlagSet, cfg *kubeadmapiv1.InitConfiguration) {
 	flagSet.StringVar(
 		&cfg.LocalAPIEndpoint.AdvertiseAddress, options.APIServerAdvertiseAddress, cfg.LocalAPIEndpoint.AdvertiseAddress,
 		"The IP address the API Server will advertise it's listening on. If not set the default network interface will be used.",
@@ -220,7 +234,7 @@ func AddInitConfigFlags(flagSet *flag.FlagSet, cfg *kubeadmapiv1beta2.InitConfig
 }
 
 // AddClusterConfigFlags adds cluster flags bound to the config to the specified flagset
-func AddClusterConfigFlags(flagSet *flag.FlagSet, cfg *kubeadmapiv1beta2.ClusterConfiguration, featureGatesString *string) {
+func AddClusterConfigFlags(flagSet *flag.FlagSet, cfg *kubeadmapiv1.ClusterConfiguration, featureGatesString *string) {
 	flagSet.StringVar(
 		&cfg.Networking.ServiceSubnet, options.NetworkingServiceSubnet, cfg.Networking.ServiceSubnet,
 		"Use alternative range of IP address for service VIPs.",
@@ -276,16 +290,16 @@ func AddInitOtherFlags(flagSet *flag.FlagSet, initOptions *initOptions) {
 		&initOptions.skipCertificateKeyPrint, options.SkipCertificateKeyPrint, initOptions.skipCertificateKeyPrint,
 		"Don't print the key used to encrypt the control-plane certificates.",
 	)
-	options.AddKustomizePodsFlag(flagSet, &initOptions.kustomizeDir)
+	options.AddPatchesFlag(flagSet, &initOptions.patchesDir)
 }
 
 // newInitOptions returns a struct ready for being used for creating cmd init flags.
 func newInitOptions() *initOptions {
 	// initialize the public kubeadm config API by applying defaults
-	externalInitCfg := &kubeadmapiv1beta2.InitConfiguration{}
+	externalInitCfg := &kubeadmapiv1.InitConfiguration{}
 	kubeadmscheme.Scheme.Default(externalInitCfg)
 
-	externalClusterCfg := &kubeadmapiv1beta2.ClusterConfiguration{}
+	externalClusterCfg := &kubeadmapiv1.ClusterConfiguration{}
 	kubeadmscheme.Scheme.Default(externalClusterCfg)
 
 	// Create the options object for the bootstrap token-related flags, and override the default value for .Description
@@ -339,12 +353,9 @@ func newInitData(cmd *cobra.Command, args []string, options *initOptions, out io
 	// Also set the union of pre-flight errors to InitConfiguration, to provide a consistent view of the runtime configuration:
 	cfg.NodeRegistration.IgnorePreflightErrors = ignorePreflightErrorsSet.List()
 
-	// override node name and CRI socket from the command line options
+	// override node name from the command line option
 	if options.externalInitCfg.NodeRegistration.Name != "" {
 		cfg.NodeRegistration.Name = options.externalInitCfg.NodeRegistration.Name
-	}
-	if options.externalInitCfg.NodeRegistration.CRISocket != "" {
-		cfg.NodeRegistration.CRISocket = options.externalInitCfg.NodeRegistration.CRISocket
 	}
 
 	if err := configutil.VerifyAPIServerBindAddress(cfg.LocalAPIEndpoint.AdvertiseAddress); err != nil {
@@ -377,9 +388,6 @@ func newInitData(cmd *cobra.Command, args []string, options *initOptions, out io
 		// Validate that also the required kubeconfig files exists and are invalid, because
 		// kubeadm can't regenerate them without the CA Key
 		kubeconfigDir := options.kubeconfigDir
-		if options.dryRun {
-			kubeconfigDir = dryRunDir
-		}
 		if err := kubeconfigphase.ValidateKubeconfigsForExternalCA(kubeconfigDir, cfg); err != nil {
 			return nil, err
 		}
@@ -412,7 +420,7 @@ func newInitData(cmd *cobra.Command, args []string, options *initOptions, out io
 		outputWriter:            out,
 		uploadCerts:             options.uploadCerts,
 		skipCertificateKeyPrint: options.skipCertificateKeyPrint,
-		kustomizeDir:            options.kustomizeDir,
+		patchesDir:              options.patchesDir,
 	}, nil
 }
 
@@ -517,7 +525,7 @@ func (d *initData) OutputWriter() io.Writer {
 func (d *initData) Client() (clientset.Interface, error) {
 	if d.client == nil {
 		if d.dryRun {
-			svcSubnetCIDR, err := kubeadmconstants.GetKubernetesServiceCIDR(d.cfg.Networking.ServiceSubnet, features.Enabled(d.cfg.FeatureGates, features.IPv6DualStack))
+			svcSubnetCIDR, err := kubeadmconstants.GetKubernetesServiceCIDR(d.cfg.Networking.ServiceSubnet)
 			if err != nil {
 				return nil, errors.Wrapf(err, "unable to get internal Kubernetes Service IP from the given service CIDR (%s)", d.cfg.Networking.ServiceSubnet)
 			}
@@ -545,9 +553,16 @@ func (d *initData) Tokens() []string {
 	return tokens
 }
 
-// KustomizeDir returns the folder where kustomize patches for static pod manifest are stored
-func (d *initData) KustomizeDir() string {
-	return d.kustomizeDir
+// PatchesDir returns the folder where patches for components are stored
+func (d *initData) PatchesDir() string {
+	// If provided, make the flag value override the one in config.
+	if len(d.patchesDir) > 0 {
+		return d.patchesDir
+	}
+	if d.cfg.Patches != nil {
+		return d.cfg.Patches.Directory
+	}
+	return ""
 }
 
 func printJoinCommand(out io.Writer, adminKubeConfigPath, token string, i *initData) error {

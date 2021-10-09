@@ -1,3 +1,4 @@
+//go:build linux && !dockerless
 // +build linux,!dockerless
 
 /*
@@ -183,6 +184,15 @@ func TestCNIPlugin(t *testing.T) {
 				},
 			}, cmd, args...)
 		},
+		func(cmd string, args ...string) exec.Cmd {
+			return fakeexec.InitFakeCmd(&fakeexec.FakeCmd{
+				CombinedOutputScript: []fakeexec.FakeAction{
+					func() ([]byte, []byte, error) {
+						return []byte(podIPOutput), nil, nil
+					},
+				},
+			}, cmd, args...)
+		},
 	}
 
 	fexec := &fakeexec.FakeExec{
@@ -247,7 +257,6 @@ func TestCNIPlugin(t *testing.T) {
 	ports := map[string][]*hostport.PortMapping{
 		containerID.ID: {
 			{
-				Name:          "name",
 				HostPort:      8008,
 				ContainerPort: 80,
 				Protocol:      "UDP",

@@ -25,6 +25,7 @@ import (
 	"strings"
 	"time"
 
+	apiserverinternalv1alpha1 "k8s.io/api/apiserverinternal/v1alpha1"
 	appsv1beta1 "k8s.io/api/apps/v1beta1"
 	autoscalingv2beta1 "k8s.io/api/autoscaling/v2beta1"
 	batchv1 "k8s.io/api/batch/v1"
@@ -34,18 +35,22 @@ import (
 	apiv1 "k8s.io/api/core/v1"
 	discoveryv1beta1 "k8s.io/api/discovery/v1beta1"
 	extensionsv1beta1 "k8s.io/api/extensions/v1beta1"
-	flowcontrolv1alpha1 "k8s.io/api/flowcontrol/v1alpha1"
+	flowcontrolv1beta2 "k8s.io/api/flowcontrol/v1beta2"
 	policyv1beta1 "k8s.io/api/policy/v1beta1"
 	rbacv1beta1 "k8s.io/api/rbac/v1beta1"
 	schedulingv1 "k8s.io/api/scheduling/v1"
 	storagev1 "k8s.io/api/storage/v1"
+	storagev1alpha1 "k8s.io/api/storage/v1alpha1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/util/duration"
 	"k8s.io/apimachinery/pkg/util/sets"
+	utilfeature "k8s.io/apiserver/pkg/util/feature"
+	"k8s.io/client-go/util/certificate/csr"
 	"k8s.io/kubernetes/pkg/apis/admissionregistration"
+	"k8s.io/kubernetes/pkg/apis/apiserverinternal"
 	"k8s.io/kubernetes/pkg/apis/apps"
 	"k8s.io/kubernetes/pkg/apis/autoscaling"
 	"k8s.io/kubernetes/pkg/apis/batch"
@@ -63,6 +68,7 @@ import (
 	"k8s.io/kubernetes/pkg/apis/scheduling"
 	"k8s.io/kubernetes/pkg/apis/storage"
 	storageutil "k8s.io/kubernetes/pkg/apis/storage/util"
+	"k8s.io/kubernetes/pkg/features"
 	"k8s.io/kubernetes/pkg/printers"
 	"k8s.io/kubernetes/pkg/util/node"
 )
@@ -85,7 +91,7 @@ func AddHandlers(h printers.PrintHandler) {
 		{Name: "Name", Type: "string", Format: "name", Description: metav1.ObjectMeta{}.SwaggerDoc()["name"]},
 		{Name: "Ready", Type: "string", Description: "The aggregate readiness state of this pod for accepting traffic."},
 		{Name: "Status", Type: "string", Description: "The aggregate status of the containers in this pod."},
-		{Name: "Restarts", Type: "integer", Description: "The number of times the containers in this pod have been restarted."},
+		{Name: "Restarts", Type: "string", Description: "The number of times the containers in this pod have been restarted and when the last container in this pod has restarted."},
 		{Name: "Age", Type: "string", Description: metav1.ObjectMeta{}.SwaggerDoc()["creationTimestamp"]},
 		{Name: "IP", Type: "string", Priority: 1, Description: apiv1.PodStatus{}.SwaggerDoc()["podIP"]},
 		{Name: "Node", Type: "string", Priority: 1, Description: apiv1.PodSpec{}.SwaggerDoc()["nodeName"]},
@@ -408,6 +414,7 @@ func AddHandlers(h printers.PrintHandler) {
 		{Name: "Age", Type: "string", Description: metav1.ObjectMeta{}.SwaggerDoc()["creationTimestamp"]},
 		{Name: "SignerName", Type: "string", Description: certificatesv1beta1.CertificateSigningRequestSpec{}.SwaggerDoc()["signerName"]},
 		{Name: "Requestor", Type: "string", Description: certificatesv1beta1.CertificateSigningRequestSpec{}.SwaggerDoc()["request"]},
+		{Name: "RequestedDuration", Type: "string", Description: certificatesv1beta1.CertificateSigningRequestSpec{}.SwaggerDoc()["expirationSeconds"]},
 		{Name: "Condition", Type: "string", Description: certificatesv1beta1.CertificateSigningRequestStatus{}.SwaggerDoc()["conditions"]},
 	}
 	h.TableHandler(certificateSigningRequestColumnDefinitions, printCertificateSigningRequest)
@@ -509,11 +516,31 @@ func AddHandlers(h printers.PrintHandler) {
 		{Name: "Name", Type: "string", Format: "name", Description: metav1.ObjectMeta{}.SwaggerDoc()["name"]},
 		{Name: "AttachRequired", Type: "boolean", Description: storagev1.CSIDriverSpec{}.SwaggerDoc()["attachRequired"]},
 		{Name: "PodInfoOnMount", Type: "boolean", Description: storagev1.CSIDriverSpec{}.SwaggerDoc()["podInfoOnMount"]},
+	}
+	if utilfeature.DefaultFeatureGate.Enabled(features.CSIStorageCapacity) {
+		csiDriverColumnDefinitions = append(csiDriverColumnDefinitions, metav1.TableColumnDefinition{
+			Name: "StorageCapacity", Type: "boolean", Description: storagev1.CSIDriverSpec{}.SwaggerDoc()["storageCapacity"],
+		})
+	}
+	csiDriverColumnDefinitions = append(csiDriverColumnDefinitions, []metav1.TableColumnDefinition{
+		{Name: "TokenRequests", Type: "string", Description: storagev1.CSIDriverSpec{}.SwaggerDoc()["tokenRequests"]},
+		{Name: "RequiresRepublish", Type: "boolean", Description: storagev1.CSIDriverSpec{}.SwaggerDoc()["requiresRepublish"]},
+	}...)
+
+	csiDriverColumnDefinitions = append(csiDriverColumnDefinitions, []metav1.TableColumnDefinition{
 		{Name: "Modes", Type: "string", Description: storagev1.CSIDriverSpec{}.SwaggerDoc()["volumeLifecycleModes"]},
 		{Name: "Age", Type: "string", Description: metav1.ObjectMeta{}.SwaggerDoc()["creationTimestamp"]},
-	}
+	}...)
 	h.TableHandler(csiDriverColumnDefinitions, printCSIDriver)
 	h.TableHandler(csiDriverColumnDefinitions, printCSIDriverList)
+
+	csiStorageCapacityColumnDefinitions := []metav1.TableColumnDefinition{
+		{Name: "Name", Type: "string", Format: "name", Description: metav1.ObjectMeta{}.SwaggerDoc()["name"]},
+		{Name: "StorageClassName", Type: "string", Description: storagev1alpha1.CSIStorageCapacity{}.SwaggerDoc()["storageClassName"]},
+		{Name: "Capacity", Type: "string", Description: storagev1alpha1.CSIStorageCapacity{}.SwaggerDoc()["capacity"]},
+	}
+	h.TableHandler(csiStorageCapacityColumnDefinitions, printCSIStorageCapacity)
+	h.TableHandler(csiStorageCapacityColumnDefinitions, printCSIStorageCapacityList)
 
 	mutatingWebhookColumnDefinitions := []metav1.TableColumnDefinition{
 		{Name: "Name", Type: "string", Format: "name", Description: metav1.ObjectMeta{}.SwaggerDoc()["name"]},
@@ -533,9 +560,9 @@ func AddHandlers(h printers.PrintHandler) {
 
 	flowSchemaColumnDefinitions := []metav1.TableColumnDefinition{
 		{Name: "Name", Type: "string", Format: "name", Description: metav1.ObjectMeta{}.SwaggerDoc()["name"]},
-		{Name: "PriorityLevel", Type: "string", Description: flowcontrolv1alpha1.PriorityLevelConfigurationReference{}.SwaggerDoc()["name"]},
-		{Name: "MatchingPrecedence", Type: "string", Description: flowcontrolv1alpha1.FlowSchemaSpec{}.SwaggerDoc()["matchingPrecedence"]},
-		{Name: "DistinguisherMethod", Type: "string", Description: flowcontrolv1alpha1.FlowSchemaSpec{}.SwaggerDoc()["distinguisherMethod"]},
+		{Name: "PriorityLevel", Type: "string", Description: flowcontrolv1beta2.PriorityLevelConfigurationReference{}.SwaggerDoc()["name"]},
+		{Name: "MatchingPrecedence", Type: "string", Description: flowcontrolv1beta2.FlowSchemaSpec{}.SwaggerDoc()["matchingPrecedence"]},
+		{Name: "DistinguisherMethod", Type: "string", Description: flowcontrolv1beta2.FlowSchemaSpec{}.SwaggerDoc()["distinguisherMethod"]},
 		{Name: "Age", Type: "string", Description: metav1.ObjectMeta{}.SwaggerDoc()["creationTimestamp"]},
 		{Name: "MissingPL", Type: "string", Description: "references a broken or non-existent PriorityLevelConfiguration"},
 	}
@@ -544,15 +571,24 @@ func AddHandlers(h printers.PrintHandler) {
 
 	priorityLevelColumnDefinitions := []metav1.TableColumnDefinition{
 		{Name: "Name", Type: "string", Format: "name", Description: metav1.ObjectMeta{}.SwaggerDoc()["name"]},
-		{Name: "Type", Type: "string", Description: flowcontrolv1alpha1.PriorityLevelConfigurationSpec{}.SwaggerDoc()["type"]},
-		{Name: "AssuredConcurrencyShares", Type: "string", Description: flowcontrolv1alpha1.LimitedPriorityLevelConfiguration{}.SwaggerDoc()["assuredConcurrencyShares"]},
-		{Name: "Queues", Type: "string", Description: flowcontrolv1alpha1.QueuingConfiguration{}.SwaggerDoc()["queues"]},
-		{Name: "HandSize", Type: "string", Description: flowcontrolv1alpha1.QueuingConfiguration{}.SwaggerDoc()["handSize"]},
-		{Name: "QueueLengthLimit", Type: "string", Description: flowcontrolv1alpha1.QueuingConfiguration{}.SwaggerDoc()["queueLengthLimit"]},
+		{Name: "Type", Type: "string", Description: flowcontrolv1beta2.PriorityLevelConfigurationSpec{}.SwaggerDoc()["type"]},
+		{Name: "AssuredConcurrencyShares", Type: "string", Description: flowcontrolv1beta2.LimitedPriorityLevelConfiguration{}.SwaggerDoc()["assuredConcurrencyShares"]},
+		{Name: "Queues", Type: "string", Description: flowcontrolv1beta2.QueuingConfiguration{}.SwaggerDoc()["queues"]},
+		{Name: "HandSize", Type: "string", Description: flowcontrolv1beta2.QueuingConfiguration{}.SwaggerDoc()["handSize"]},
+		{Name: "QueueLengthLimit", Type: "string", Description: flowcontrolv1beta2.QueuingConfiguration{}.SwaggerDoc()["queueLengthLimit"]},
 		{Name: "Age", Type: "string", Description: metav1.ObjectMeta{}.SwaggerDoc()["creationTimestamp"]},
 	}
 	h.TableHandler(priorityLevelColumnDefinitions, printPriorityLevelConfiguration)
 	h.TableHandler(priorityLevelColumnDefinitions, printPriorityLevelConfigurationList)
+
+	storageVersionColumnDefinitions := []metav1.TableColumnDefinition{
+		{Name: "Name", Type: "string", Format: "name", Description: metav1.ObjectMeta{}.SwaggerDoc()["name"]},
+		{Name: "CommonEncodingVersion", Type: "string", Description: apiserverinternalv1alpha1.StorageVersionStatus{}.SwaggerDoc()["commonEncodingVersion"]},
+		{Name: "StorageVersions", Type: "string", Description: apiserverinternalv1alpha1.StorageVersionStatus{}.SwaggerDoc()["storageVersions"]},
+		{Name: "Age", Type: "string", Description: metav1.ObjectMeta{}.SwaggerDoc()["creationTimestamp"]},
+	}
+	h.TableHandler(storageVersionColumnDefinitions, printStorageVersion)
+	h.TableHandler(storageVersionColumnDefinitions, printStorageVersionList)
 }
 
 // Pass ports=nil for all ports.
@@ -706,6 +742,7 @@ func printPod(pod *api.Pod, options printers.GenerateOptions) ([]metav1.TableRow
 	restarts := 0
 	totalContainers := len(pod.Spec.Containers)
 	readyContainers := 0
+	lastRestartDate := metav1.NewTime(time.Time{})
 
 	reason := string(pod.Status.Phase)
 	if pod.Status.Reason != "" {
@@ -727,6 +764,12 @@ func printPod(pod *api.Pod, options printers.GenerateOptions) ([]metav1.TableRow
 	for i := range pod.Status.InitContainerStatuses {
 		container := pod.Status.InitContainerStatuses[i]
 		restarts += int(container.RestartCount)
+		if container.LastTerminationState.Terminated != nil {
+			terminatedDate := container.LastTerminationState.Terminated.FinishedAt
+			if lastRestartDate.Before(&terminatedDate) {
+				lastRestartDate = terminatedDate
+			}
+		}
 		switch {
 		case container.State.Terminated != nil && container.State.Terminated.ExitCode == 0:
 			continue
@@ -758,6 +801,12 @@ func printPod(pod *api.Pod, options printers.GenerateOptions) ([]metav1.TableRow
 			container := pod.Status.ContainerStatuses[i]
 
 			restarts += int(container.RestartCount)
+			if container.LastTerminationState.Terminated != nil {
+				terminatedDate := container.LastTerminationState.Terminated.FinishedAt
+				if lastRestartDate.Before(&terminatedDate) {
+					lastRestartDate = terminatedDate
+				}
+			}
 			if container.State.Waiting != nil && container.State.Waiting.Reason != "" {
 				reason = container.State.Waiting.Reason
 			} else if container.State.Terminated != nil && container.State.Terminated.Reason != "" {
@@ -790,7 +839,12 @@ func printPod(pod *api.Pod, options printers.GenerateOptions) ([]metav1.TableRow
 		reason = "Terminating"
 	}
 
-	row.Cells = append(row.Cells, pod.Name, fmt.Sprintf("%d/%d", readyContainers, totalContainers), reason, int64(restarts), translateTimestampSince(pod.CreationTimestamp))
+	restartsStr := strconv.Itoa(restarts)
+	if !lastRestartDate.IsZero() {
+		restartsStr = fmt.Sprintf("%d (%s ago)", restarts, translateTimestampSince(lastRestartDate))
+	}
+
+	row.Cells = append(row.Cells, pod.Name, fmt.Sprintf("%d/%d", readyContainers, totalContainers), reason, restartsStr, translateTimestampSince(pod.CreationTimestamp))
 	if options.Wide {
 		nodeName := pod.Spec.NodeName
 		nominatedNodeName := pod.Status.NominatedNodeName
@@ -1102,10 +1156,11 @@ func printService(obj *api.Service, options printers.GenerateOptions) ([]metav1.
 		Object: runtime.RawExtension{Object: obj},
 	}
 	svcType := obj.Spec.Type
-	internalIP := obj.Spec.ClusterIP
-	if len(internalIP) == 0 {
-		internalIP = "<none>"
+	internalIP := "<none>"
+	if len(obj.Spec.ClusterIPs) > 0 {
+		internalIP = obj.Spec.ClusterIPs[0]
 	}
+
 	externalIP := getServiceExternalIP(obj, options.Wide)
 	svcPorts := makePortString(obj.Spec.Ports)
 	if len(svcPorts) == 0 {
@@ -1357,7 +1412,30 @@ func printCSIDriver(obj *storage.CSIDriver, options printers.GenerateOptions) ([
 		modes = "<none>"
 	}
 
-	row.Cells = append(row.Cells, obj.Name, attachRequired, podInfoOnMount, modes, translateTimestampSince(obj.CreationTimestamp))
+	row.Cells = append(row.Cells, obj.Name, attachRequired, podInfoOnMount)
+	if utilfeature.DefaultFeatureGate.Enabled(features.CSIStorageCapacity) {
+		storageCapacity := false
+		if obj.Spec.StorageCapacity != nil {
+			storageCapacity = *obj.Spec.StorageCapacity
+		}
+		row.Cells = append(row.Cells, storageCapacity)
+	}
+
+	tokenRequests := "<unset>"
+	if obj.Spec.TokenRequests != nil {
+		audiences := []string{}
+		for _, t := range obj.Spec.TokenRequests {
+			audiences = append(audiences, t.Audience)
+		}
+		tokenRequests = strings.Join(audiences, ",")
+	}
+	requiresRepublish := false
+	if obj.Spec.RequiresRepublish != nil {
+		requiresRepublish = *obj.Spec.RequiresRepublish
+	}
+	row.Cells = append(row.Cells, tokenRequests, requiresRepublish)
+
+	row.Cells = append(row.Cells, modes, translateTimestampSince(obj.CreationTimestamp))
 	return []metav1.TableRow{row}, nil
 }
 
@@ -1365,6 +1443,32 @@ func printCSIDriverList(list *storage.CSIDriverList, options printers.GenerateOp
 	rows := make([]metav1.TableRow, 0, len(list.Items))
 	for i := range list.Items {
 		r, err := printCSIDriver(&list.Items[i], options)
+		if err != nil {
+			return nil, err
+		}
+		rows = append(rows, r...)
+	}
+	return rows, nil
+}
+
+func printCSIStorageCapacity(obj *storage.CSIStorageCapacity, options printers.GenerateOptions) ([]metav1.TableRow, error) {
+	row := metav1.TableRow{
+		Object: runtime.RawExtension{Object: obj},
+	}
+
+	capacity := "<unset>"
+	if obj.Capacity != nil {
+		capacity = obj.Capacity.String()
+	}
+
+	row.Cells = append(row.Cells, obj.Name, obj.StorageClassName, capacity)
+	return []metav1.TableRow{row}, nil
+}
+
+func printCSIStorageCapacityList(list *storage.CSIStorageCapacityList, options printers.GenerateOptions) ([]metav1.TableRow, error) {
+	rows := make([]metav1.TableRow, 0, len(list.Items))
+	for i := range list.Items {
+		r, err := printCSIStorageCapacity(&list.Items[i], options)
 		if err != nil {
 			return nil, err
 		}
@@ -1673,9 +1777,19 @@ func printEvent(obj *api.Event, options printers.GenerateOptions) ([]metav1.Tabl
 	if obj.FirstTimestamp.IsZero() {
 		firstTimestamp = translateMicroTimestampSince(obj.EventTime)
 	}
+
 	lastTimestamp := translateTimestampSince(obj.LastTimestamp)
 	if obj.LastTimestamp.IsZero() {
 		lastTimestamp = firstTimestamp
+	}
+
+	count := obj.Count
+	if obj.Series != nil {
+		lastTimestamp = translateMicroTimestampSince(obj.Series.LastObservedTime)
+		count = obj.Series.Count
+	} else if count == 0 {
+		// Singleton events don't have a count set in the new API.
+		count = 1
 	}
 
 	var target string
@@ -1691,10 +1805,10 @@ func printEvent(obj *api.Event, options printers.GenerateOptions) ([]metav1.Tabl
 			obj.Reason,
 			target,
 			obj.InvolvedObject.FieldPath,
-			formatEventSource(obj.Source),
+			formatEventSource(obj.Source, obj.ReportingController, obj.ReportingInstance),
 			strings.TrimSpace(obj.Message),
 			firstTimestamp,
-			int64(obj.Count),
+			int64(count),
 			obj.Name,
 		)
 	} else {
@@ -1786,7 +1900,11 @@ func printCertificateSigningRequest(obj *certificates.CertificateSigningRequest,
 	if obj.Spec.SignerName != "" {
 		signerName = obj.Spec.SignerName
 	}
-	row.Cells = append(row.Cells, obj.Name, translateTimestampSince(obj.CreationTimestamp), signerName, obj.Spec.Username, status)
+	requestedDuration := "<none>"
+	if obj.Spec.ExpirationSeconds != nil {
+		requestedDuration = duration.HumanDuration(csr.ExpirationSecondsToDuration(*obj.Spec.ExpirationSeconds))
+	}
+	row.Cells = append(row.Cells, obj.Name, translateTimestampSince(obj.CreationTimestamp), signerName, obj.Spec.Username, requestedDuration, status)
 	return []metav1.TableRow{row}, nil
 }
 
@@ -1962,6 +2080,25 @@ func formatHPAMetrics(specs []autoscaling.MetricSpec, statuses []autoscaling.Met
 				target := "<auto>"
 				if spec.Resource.Target.AverageUtilization != nil {
 					target = fmt.Sprintf("%d%%", *spec.Resource.Target.AverageUtilization)
+				}
+				list = append(list, fmt.Sprintf("%s/%s", current, target))
+			}
+		case autoscaling.ContainerResourceMetricSourceType:
+			if spec.ContainerResource.Target.AverageValue != nil {
+				current := "<unknown>"
+				if len(statuses) > i && statuses[i].ContainerResource != nil {
+					current = statuses[i].ContainerResource.Current.AverageValue.String()
+				}
+				list = append(list, fmt.Sprintf("%s/%s", current, spec.ContainerResource.Target.AverageValue.String()))
+			} else {
+				current := "<unknown>"
+				if len(statuses) > i && statuses[i].ContainerResource != nil && statuses[i].ContainerResource.Current.AverageUtilization != nil {
+					current = fmt.Sprintf("%d%%", *statuses[i].ContainerResource.Current.AverageUtilization)
+				}
+
+				target := "<auto>"
+				if spec.ContainerResource.Target.AverageUtilization != nil {
+					target = fmt.Sprintf("%d%%", *spec.ContainerResource.Target.AverageUtilization)
 				}
 				list = append(list, fmt.Sprintf("%s/%s", current, target))
 			}
@@ -2181,13 +2318,29 @@ func layoutContainerCells(containers []api.Container) (names string, images stri
 	return namesBuffer.String(), imagesBuffer.String()
 }
 
-// formatEventSource formats EventSource as a comma separated string excluding Host when empty
-func formatEventSource(es api.EventSource) string {
-	EventSourceString := []string{es.Component}
-	if len(es.Host) > 0 {
-		EventSourceString = append(EventSourceString, es.Host)
+// formatEventSource formats EventSource as a comma separated string excluding Host when empty.
+// It uses reportingController when Source.Component is empty and reportingInstance when Source.Host is empty
+func formatEventSource(es api.EventSource, reportingController, reportingInstance string) string {
+	return formatEventSourceComponentInstance(
+		firstNonEmpty(es.Component, reportingController),
+		firstNonEmpty(es.Host, reportingInstance),
+	)
+}
+
+func firstNonEmpty(ss ...string) string {
+	for _, s := range ss {
+		if len(s) > 0 {
+			return s
+		}
 	}
-	return strings.Join(EventSourceString, ", ")
+	return ""
+}
+
+func formatEventSourceComponentInstance(component, instance string) string {
+	if len(instance) == 0 {
+		return component
+	}
+	return component + ", " + instance
 }
 
 func printControllerRevision(obj *apps.ControllerRevision, options printers.GenerateOptions) ([]metav1.TableRow, error) {
@@ -2387,6 +2540,46 @@ func printFlowSchemaList(list *flowcontrol.FlowSchemaList, options printers.Gene
 	sort.Sort(fsSeq)
 	for i := range fsSeq {
 		r, err := printFlowSchema(fsSeq[i], options)
+		if err != nil {
+			return nil, err
+		}
+		rows = append(rows, r...)
+	}
+	return rows, nil
+}
+
+func printStorageVersion(obj *apiserverinternal.StorageVersion, options printers.GenerateOptions) ([]metav1.TableRow, error) {
+	row := metav1.TableRow{
+		Object: runtime.RawExtension{Object: obj},
+	}
+	commonEncodingVersion := "<unset>"
+	if obj.Status.CommonEncodingVersion != nil {
+		commonEncodingVersion = *obj.Status.CommonEncodingVersion
+	}
+	row.Cells = append(row.Cells, obj.Name, commonEncodingVersion, formatStorageVersions(obj.Status.StorageVersions), translateTimestampSince(obj.CreationTimestamp))
+	return []metav1.TableRow{row}, nil
+}
+
+func formatStorageVersions(storageVersions []apiserverinternal.ServerStorageVersion) string {
+	list := []string{}
+	max := 3
+	more := false
+	count := 0
+	for _, sv := range storageVersions {
+		if len(list) < max {
+			list = append(list, fmt.Sprintf("%s=%s", sv.APIServerID, sv.EncodingVersion))
+		} else if len(list) == max {
+			more = true
+		}
+		count++
+	}
+	return listWithMoreString(list, more, count, max)
+}
+
+func printStorageVersionList(list *apiserverinternal.StorageVersionList, options printers.GenerateOptions) ([]metav1.TableRow, error) {
+	rows := make([]metav1.TableRow, 0, len(list.Items))
+	for i := range list.Items {
+		r, err := printStorageVersion(&list.Items[i], options)
 		if err != nil {
 			return nil, err
 		}

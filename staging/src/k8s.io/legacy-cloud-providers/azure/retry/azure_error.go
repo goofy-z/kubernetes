@@ -1,3 +1,4 @@
+//go:build !providerless
 // +build !providerless
 
 /*
@@ -76,7 +77,7 @@ func (err *Error) Error() error {
 		retryAfterSeconds = int(err.RetryAfter.Sub(curTime) / time.Second)
 	}
 
-	return fmt.Errorf("Retriable: %v, RetryAfter: %ds, HTTPStatusCode: %d, RawError: %v",
+	return fmt.Errorf("Retriable: %v, RetryAfter: %ds, HTTPStatusCode: %d, RawError: %w",
 		err.Retriable, retryAfterSeconds, err.HTTPStatusCode, err.RawError)
 }
 
@@ -87,6 +88,15 @@ func (err *Error) IsThrottled() bool {
 	}
 
 	return err.HTTPStatusCode == http.StatusTooManyRequests || err.RetryAfter.After(now())
+}
+
+// IsNotFound returns true the if the requested object wasn't found
+func (err *Error) IsNotFound() bool {
+	if err == nil {
+		return false
+	}
+
+	return err.HTTPStatusCode == http.StatusNotFound
 }
 
 // NewError creates a new Error.
@@ -170,7 +180,7 @@ func getRawError(resp *http.Response, err error) error {
 		return fmt.Errorf("empty HTTP response")
 	}
 
-	// return the http status if unabled to get response body.
+	// return the http status if it is unable to get response body.
 	defer resp.Body.Close()
 	respBody, _ := ioutil.ReadAll(resp.Body)
 	resp.Body = ioutil.NopCloser(bytes.NewReader(respBody))
@@ -285,4 +295,21 @@ func IsErrorRetriable(err error) bool {
 	}
 
 	return strings.Contains(err.Error(), "Retriable: true")
+}
+
+// HasStatusForbiddenOrIgnoredError return true if the given error code is part of the error message
+// This should only be used when trying to delete resources
+func HasStatusForbiddenOrIgnoredError(err error) bool {
+	if err == nil {
+		return false
+	}
+
+	if strings.Contains(err.Error(), fmt.Sprintf("HTTPStatusCode: %d", http.StatusNotFound)) {
+		return true
+	}
+
+	if strings.Contains(err.Error(), fmt.Sprintf("HTTPStatusCode: %d", http.StatusForbidden)) {
+		return true
+	}
+	return false
 }

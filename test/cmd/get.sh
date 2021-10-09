@@ -206,8 +206,8 @@ run_kubectl_get_tests() {
   kubectl delete pods redis-master valid-pod "${kube_flags[@]}"
 
   ### Test 'kubectl get -k <dir>' prints all the items built from a kustomization directory
-  # Pre-condition: no ConfigMap, Deployment, Service exist
-  kube::test::get_object_assert configmaps "{{range.items}}{{$id_field}}:{{end}}" ''
+  # Pre-Condition: No configmaps with name=test-the-map, no Deployment, Service exist
+  kube::test::get_object_assert 'configmaps --field-selector=metadata.name=test-the-map' "{{range.items}}{{${id_field:?}}}:{{end}}" ''
   kube::test::get_object_assert deployment "{{range.items}}{{$id_field}}:{{end}}" ''
   kube::test::get_object_assert services "{{range.items}}{{$id_field}}:{{end}}" ''
   # Command
@@ -224,7 +224,7 @@ run_kubectl_get_tests() {
   kubectl delete -k hack/testdata/kustomize
 
   # Check that all items in the list are deleted
-  kube::test::get_object_assert configmaps "{{range.items}}{{$id_field}}:{{end}}" ''
+  kube::test::get_object_assert 'configmaps --field-selector=metadata.name=test-the-map' "{{range.items}}{{${id_field:?}}}:{{end}}" ''
   kube::test::get_object_assert deployment "{{range.items}}{{$id_field}}:{{end}}" ''
   kube::test::get_object_assert services "{{range.items}}{{$id_field}}:{{end}}" ''
 
@@ -315,6 +315,22 @@ run_kubectl_sort_by_tests() {
   output_message=$(kubectl get pods --sort-by="{metadata.creationTimestamp}")
   kube::test::if_sort_by_has_correct_order "${output_message}" "sorted-pod1:sorted-pod2:sorted-pod3:"
 
+  # ensure sorting by resource memory request works
+  output_message=$(kubectl get pods --sort-by="{.spec.containers[0].resources.requests.memory}")
+  kube::test::if_sort_by_has_correct_order "${output_message}" "sorted-pod3:sorted-pod1:sorted-pod2:"
+
+  # ensure sorting by resource cpu request works
+  output_message=$(kubectl get pods --sort-by="{.spec.containers[0].resources.requests.cpu}")
+  kube::test::if_sort_by_has_correct_order "${output_message}" "sorted-pod3:sorted-pod1:sorted-pod2:"
+
+  # ensure sorting by resource memory limit works
+  output_message=$(kubectl get pods --sort-by="{.spec.containers[0].resources.limits.memory}")
+  kube::test::if_sort_by_has_correct_order "${output_message}" "sorted-pod3:sorted-pod1:sorted-pod2:"
+
+  # ensure sorting by resource cpu limit works
+   output_message=$(kubectl get pods --sort-by="{.spec.containers[0].resources.limits.cpu}")
+  kube::test::if_sort_by_has_correct_order "${output_message}" "sorted-pod3:sorted-pod1:sorted-pod2:"
+
   # ensure sorting using fallback codepath still works
   output_message=$(kubectl get pods --sort-by="{spec.containers[0].name}" --server-print=false --v=8 2>&1)
   kube::test::if_sort_by_has_correct_order "${output_message}" "sorted-pod2:sorted-pod1:sorted-pod3:"
@@ -386,6 +402,26 @@ run_kubectl_all_namespace_tests() {
   output_message=$(kubectl get nodes --all-namespaces 2>&1)
   # Post-condition: output with no NAMESPACE field
   kube::test::if_has_not_string "${output_message}" "NAMESPACE"
+
+  set +o nounset
+  set +o errexit
+}
+
+
+run_deprecated_api_tests() {
+  set -o nounset
+  set -o errexit
+
+  create_and_use_new_namespace
+  kube::log::status "Testing deprecated APIs"
+
+  # Test deprecated API request output
+  # TODO(liggitt): switch this to a custom deprecated resource once CRDs support marking versions as deprecated
+  output_message=$(kubectl get podsecuritypolicies.v1beta1.policy 2>&1 "${kube_flags[@]}")
+  kube::test::if_has_string "${output_message}" 'PodSecurityPolicy is deprecated'
+  output_message=$(! kubectl get podsecuritypolicies.v1beta1.policy --warnings-as-errors 2>&1 "${kube_flags[@]}")
+  kube::test::if_has_string "${output_message}" 'PodSecurityPolicy is deprecated'
+  kube::test::if_has_string "${output_message}" 'err="1 warning received"'
 
   set +o nounset
   set +o errexit

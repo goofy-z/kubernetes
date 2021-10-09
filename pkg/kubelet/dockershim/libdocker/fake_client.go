@@ -1,3 +1,4 @@
+//go:build !dockerless
 // +build !dockerless
 
 /*
@@ -35,7 +36,7 @@ import (
 	dockerimagetypes "github.com/docker/docker/api/types/image"
 
 	"k8s.io/api/core/v1"
-	"k8s.io/apimachinery/pkg/util/clock"
+	"k8s.io/utils/clock"
 )
 
 type CalledDetail struct {
@@ -735,9 +736,10 @@ func (f *FakeDockerClient) ResetImages() {
 func (f *FakeDockerClient) InjectImageInspects(inspects []dockertypes.ImageInspect) {
 	f.Lock()
 	defer f.Unlock()
-	for _, i := range inspects {
-		f.Images = append(f.Images, *createImageFromImageInspect(i))
-		f.ImageInspects[i.ID] = &i
+	for i := range inspects {
+		inspect := inspects[i]
+		f.Images = append(f.Images, *createImageFromImageInspect(inspect))
+		f.ImageInspects[inspect.ID] = &inspect
 	}
 }
 

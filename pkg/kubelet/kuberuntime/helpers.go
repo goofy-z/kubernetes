@@ -22,7 +22,7 @@ import (
 	"strconv"
 	"strings"
 
-	"k8s.io/api/core/v1"
+	v1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/types"
 	runtimeapi "k8s.io/cri-api/pkg/apis/runtime/v1alpha2"
 	"k8s.io/klog/v2"
@@ -81,7 +81,7 @@ func toRuntimeProtocol(protocol v1.Protocol) runtimeapi.Protocol {
 		return runtimeapi.Protocol_SCTP
 	}
 
-	klog.Warningf("Unknown protocol %q: defaulting to TCP", protocol)
+	klog.InfoS("Unknown protocol, defaulting to TCP", "protocol", protocol)
 	return runtimeapi.Protocol_TCP
 }
 
@@ -202,31 +202,119 @@ func toKubeRuntimeStatus(status *runtimeapi.RuntimeStatus) *kubecontainer.Runtim
 	return &kubecontainer.RuntimeStatus{Conditions: conditions}
 }
 
-// getSeccompProfileFromAnnotations gets seccomp profile from annotations.
-// It gets pod's profile if containerName is empty.
-func (m *kubeGenericRuntimeManager) getSeccompProfileFromAnnotations(annotations map[string]string, containerName string) string {
-	// try the pod profile.
-	profile, profileOK := annotations[v1.SeccompPodAnnotationKey]
+func fieldProfile(scmp *v1.SeccompProfile, profileRootPath string, fallbackToRuntimeDefault bool) string {
+	if scmp == nil {
+		if fallbackToRuntimeDefault {
+			return v1.SeccompProfileRuntimeDefault
+		}
+		return ""
+	}
+	if scmp.Type == v1.SeccompProfileTypeRuntimeDefault {
+		return v1.SeccompProfileRuntimeDefault
+	}
+	if scmp.Type == v1.SeccompProfileTypeLocalhost && scmp.LocalhostProfile != nil && len(*scmp.LocalhostProfile) > 0 {
+		fname := filepath.Join(profileRootPath, *scmp.LocalhostProfile)
+		return v1.SeccompLocalhostProfileNamePrefix + fname
+	}
+	if scmp.Type == v1.SeccompProfileTypeUnconfined {
+		return v1.SeccompProfileNameUnconfined
+	}
+
+	if fallbackToRuntimeDefault {
+		return v1.SeccompProfileRuntimeDefault
+	}
+	return ""
+}
+
+func annotationProfile(profile, profileRootPath string) string {
+	if strings.HasPrefix(profile, v1.SeccompLocalhostProfileNamePrefix) {
+		name := strings.TrimPrefix(profile, v1.SeccompLocalhostProfileNamePrefix)
+		fname := filepath.Join(profileRootPath, filepath.FromSlash(name))
+		return v1.SeccompLocalhostProfileNamePrefix + fname
+	}
+	return profile
+}
+
+func (m *kubeGenericRuntimeManager) getSeccompProfilePath(annotations map[string]string, containerName string,
+	podSecContext *v1.PodSecurityContext, containerSecContext *v1.SecurityContext, fallbackToRuntimeDefault bool) string {
+	// container fields are applied first
+	if containerSecContext != nil && containerSecContext.SeccompProfile != nil {
+		return fieldProfile(containerSecContext.SeccompProfile, m.seccompProfileRoot, fallbackToRuntimeDefault)
+	}
+
+	// if container field does not exist, try container annotation (deprecated)
 	if containerName != "" {
-		// try the container profile.
-		cProfile, cProfileOK := annotations[v1.SeccompContainerAnnotationKeyPrefix+containerName]
-		if cProfileOK {
-			profile = cProfile
-			profileOK = cProfileOK
+		if profile, ok := annotations[v1.SeccompContainerAnnotationKeyPrefix+containerName]; ok {
+			return annotationProfile(profile, m.seccompProfileRoot)
 		}
 	}
 
-	if !profileOK {
-		return ""
+	// when container seccomp is not defined, try to apply from pod field
+	if podSecContext != nil && podSecContext.SeccompProfile != nil {
+		return fieldProfile(podSecContext.SeccompProfile, m.seccompProfileRoot, fallbackToRuntimeDefault)
 	}
 
-	if strings.HasPrefix(profile, "localhost/") {
-		name := strings.TrimPrefix(profile, "localhost/")
-		fname := filepath.Join(m.seccompProfileRoot, filepath.FromSlash(name))
-		return "localhost/" + fname
+	// as last resort, try to apply pod annotation (deprecated)
+	if profile, ok := annotations[v1.SeccompPodAnnotationKey]; ok {
+		return annotationProfile(profile, m.seccompProfileRoot)
 	}
 
-	return profile
+	if fallbackToRuntimeDefault {
+		return v1.SeccompProfileRuntimeDefault
+	}
+
+	return ""
+}
+
+func fieldSeccompProfile(scmp *v1.SeccompProfile, profileRootPath string, fallbackToRuntimeDefault bool) *runtimeapi.SecurityProfile {
+	if scmp == nil {
+		if fallbackToRuntimeDefault {
+			return &runtimeapi.SecurityProfile{
+				ProfileType: runtimeapi.SecurityProfile_RuntimeDefault,
+			}
+		}
+		return &runtimeapi.SecurityProfile{
+			ProfileType: runtimeapi.SecurityProfile_Unconfined,
+		}
+	}
+	if scmp.Type == v1.SeccompProfileTypeRuntimeDefault {
+		return &runtimeapi.SecurityProfile{
+			ProfileType: runtimeapi.SecurityProfile_RuntimeDefault,
+		}
+	}
+	if scmp.Type == v1.SeccompProfileTypeLocalhost && scmp.LocalhostProfile != nil && len(*scmp.LocalhostProfile) > 0 {
+		fname := filepath.Join(profileRootPath, *scmp.LocalhostProfile)
+		return &runtimeapi.SecurityProfile{
+			ProfileType:  runtimeapi.SecurityProfile_Localhost,
+			LocalhostRef: fname,
+		}
+	}
+	return &runtimeapi.SecurityProfile{
+		ProfileType: runtimeapi.SecurityProfile_Unconfined,
+	}
+}
+
+func (m *kubeGenericRuntimeManager) getSeccompProfile(annotations map[string]string, containerName string,
+	podSecContext *v1.PodSecurityContext, containerSecContext *v1.SecurityContext, fallbackToRuntimeDefault bool) *runtimeapi.SecurityProfile {
+	// container fields are applied first
+	if containerSecContext != nil && containerSecContext.SeccompProfile != nil {
+		return fieldSeccompProfile(containerSecContext.SeccompProfile, m.seccompProfileRoot, fallbackToRuntimeDefault)
+	}
+
+	// when container seccomp is not defined, try to apply from pod field
+	if podSecContext != nil && podSecContext.SeccompProfile != nil {
+		return fieldSeccompProfile(podSecContext.SeccompProfile, m.seccompProfileRoot, fallbackToRuntimeDefault)
+	}
+
+	if fallbackToRuntimeDefault {
+		return &runtimeapi.SecurityProfile{
+			ProfileType: runtimeapi.SecurityProfile_RuntimeDefault,
+		}
+	}
+
+	return &runtimeapi.SecurityProfile{
+		ProfileType: runtimeapi.SecurityProfile_Unconfined,
+	}
 }
 
 func ipcNamespaceForPod(pod *v1.Pod) runtimeapi.NamespaceMode {

@@ -1,3 +1,4 @@
+//go:build !providerless
 // +build !providerless
 
 /*
@@ -241,7 +242,7 @@ func TestList(t *testing.T) {
 	armClient := mockarmclient.NewMockInterface(ctrl)
 	dpList := []resources.DeploymentExtended{getTestDeploymentExtended("dep"), getTestDeploymentExtended("dep1"), getTestDeploymentExtended("dep2")}
 	responseBody, err := json.Marshal(resources.DeploymentListResult{Value: &dpList})
-	assert.Nil(t, err)
+	assert.NoError(t, err)
 	armClient.EXPECT().GetResource(gomock.Any(), resourceID, "").Return(
 		&http.Response{
 			StatusCode: http.StatusOK,
@@ -297,7 +298,7 @@ func TestListNextResultsMultiPages(t *testing.T) {
 		dpClient := getTestDeploymentClient(armClient)
 		result, err := dpClient.listNextResults(context.TODO(), lastResult)
 		if test.prepareErr != nil || test.sendErr != nil {
-			assert.NotNil(t, err)
+			assert.Error(t, err)
 		} else {
 			assert.NoError(t, err)
 		}
@@ -346,7 +347,7 @@ func TestListNextResultsMultiPagesWithListResponderError(t *testing.T) {
 	expected.Response = autorest.Response{Response: response}
 	dpClient := getTestDeploymentClient(armClient)
 	result, err := dpClient.listNextResults(context.TODO(), lastResult)
-	assert.NotNil(t, err)
+	assert.Error(t, err)
 	assert.Equal(t, expected, result)
 }
 
@@ -358,7 +359,7 @@ func TestListWithListResponderError(t *testing.T) {
 	armClient := mockarmclient.NewMockInterface(ctrl)
 	dpList := []resources.DeploymentExtended{getTestDeploymentExtended("dep"), getTestDeploymentExtended("dep1"), getTestDeploymentExtended("dep2")}
 	responseBody, err := json.Marshal(resources.DeploymentListResult{Value: &dpList})
-	assert.Nil(t, err)
+	assert.NoError(t, err)
 	armClient.EXPECT().GetResource(gomock.Any(), resourceID, "").Return(
 		&http.Response{
 			StatusCode: http.StatusNotFound,
@@ -369,6 +370,36 @@ func TestListWithListResponderError(t *testing.T) {
 	result, rerr := dpClient.List(context.TODO(), "rg")
 	assert.NotNil(t, rerr)
 	assert.Equal(t, 0, len(result))
+}
+
+func TestListWithNextPage(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	defer ctrl.Finish()
+
+	resourceID := "/subscriptions/subscriptionID/resourceGroups/rg/providers/Microsoft.Resources/deployments"
+	armClient := mockarmclient.NewMockInterface(ctrl)
+	dpList := []resources.DeploymentExtended{getTestDeploymentExtended("dep"), getTestDeploymentExtended("dep1"), getTestDeploymentExtended("dep2")}
+	// DeploymentListResult.MarshalJson() doesn't include "nextLink" in its result, hence partialResponse is composed manually below.
+	partialResponse, err := json.Marshal(map[string]interface{}{"value": dpList, "nextLink": "nextLink"})
+	assert.NoError(t, err)
+	pagedResponse, err := json.Marshal(resources.DeploymentListResult{Value: &dpList})
+	assert.NoError(t, err)
+	armClient.EXPECT().PrepareGetRequest(gomock.Any(), gomock.Any()).Return(&http.Request{}, nil)
+	armClient.EXPECT().Send(gomock.Any(), gomock.Any()).Return(
+		&http.Response{
+			StatusCode: http.StatusOK,
+			Body:       ioutil.NopCloser(bytes.NewReader(pagedResponse)),
+		}, nil)
+	armClient.EXPECT().GetResource(gomock.Any(), resourceID, "").Return(
+		&http.Response{
+			StatusCode: http.StatusOK,
+			Body:       ioutil.NopCloser(bytes.NewReader(partialResponse)),
+		}, nil).Times(1)
+	armClient.EXPECT().CloseResponse(gomock.Any(), gomock.Any()).Times(2)
+	dpClient := getTestDeploymentClient(armClient)
+	result, rerr := dpClient.List(context.TODO(), "rg")
+	assert.Nil(t, rerr)
+	assert.Equal(t, 6, len(result))
 }
 
 func TestListNeverRateLimiter(t *testing.T) {

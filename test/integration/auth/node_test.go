@@ -26,7 +26,7 @@ import (
 
 	coordination "k8s.io/api/coordination/v1"
 	corev1 "k8s.io/api/core/v1"
-	policy "k8s.io/api/policy/v1beta1"
+	policy "k8s.io/api/policy/v1"
 	storagev1 "k8s.io/api/storage/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/resource"
@@ -54,9 +54,6 @@ func TestNodeAuthorizer(t *testing.T) {
 
 	// Enable DynamicKubeletConfig feature so that Node.Spec.ConfigSource can be set
 	defer featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, features.DynamicKubeletConfig, true)()
-
-	// Enable CSINodeInfo feature so that nodes can create CSINode objects.
-	defer featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, features.CSINodeInfo, true)()
 
 	tokenFile, err := ioutil.TempFile("", "kubeconfig")
 	if err != nil {
@@ -224,13 +221,26 @@ func TestNodeAuthorizer(t *testing.T) {
 
 	createNode2MirrorPod := func(client clientset.Interface) func() error {
 		return func() error {
-			_, err := client.CoreV1().Pods("ns").Create(context.TODO(), &corev1.Pod{
+			const nodeName = "node2"
+			node, err := client.CoreV1().Nodes().Get(context.TODO(), nodeName, metav1.GetOptions{})
+			if err != nil {
+				return err
+			}
+			controller := true
+			_, err = client.CoreV1().Pods("ns").Create(context.TODO(), &corev1.Pod{
 				ObjectMeta: metav1.ObjectMeta{
 					Name:        "node2mirrorpod",
 					Annotations: map[string]string{corev1.MirrorPodAnnotationKey: "true"},
+					OwnerReferences: []metav1.OwnerReference{{
+						APIVersion: corev1.SchemeGroupVersion.String(),
+						Kind:       "Node",
+						Name:       nodeName,
+						UID:        node.UID,
+						Controller: &controller,
+					}},
 				},
 				Spec: corev1.PodSpec{
-					NodeName:   "node2",
+					NodeName:   nodeName,
 					Containers: []corev1.Container{{Name: "image", Image: "busybox"}},
 				},
 			}, metav1.CreateOptions{})
@@ -295,9 +305,9 @@ func TestNodeAuthorizer(t *testing.T) {
 	createNode2NormalPodEviction := func(client clientset.Interface) func() error {
 		return func() error {
 			zero := int64(0)
-			return client.PolicyV1beta1().Evictions("ns").Evict(context.TODO(), &policy.Eviction{
+			return client.PolicyV1().Evictions("ns").Evict(context.TODO(), &policy.Eviction{
 				TypeMeta: metav1.TypeMeta{
-					APIVersion: "policy/v1beta1",
+					APIVersion: "policy/v1",
 					Kind:       "Eviction",
 				},
 				ObjectMeta: metav1.ObjectMeta{
@@ -311,9 +321,9 @@ func TestNodeAuthorizer(t *testing.T) {
 	createNode2MirrorPodEviction := func(client clientset.Interface) func() error {
 		return func() error {
 			zero := int64(0)
-			return client.PolicyV1beta1().Evictions("ns").Evict(context.TODO(), &policy.Eviction{
+			return client.PolicyV1().Evictions("ns").Evict(context.TODO(), &policy.Eviction{
 				TypeMeta: metav1.TypeMeta{
-					APIVersion: "policy/v1beta1",
+					APIVersion: "policy/v1",
 					Kind:       "Eviction",
 				},
 				ObjectMeta: metav1.ObjectMeta{
@@ -462,9 +472,7 @@ func TestNodeAuthorizer(t *testing.T) {
 	expectForbidden(t, getPVC(nodeanonClient))
 	expectForbidden(t, getPV(nodeanonClient))
 	expectForbidden(t, createNode2NormalPod(nodeanonClient))
-	expectForbidden(t, createNode2MirrorPod(nodeanonClient))
 	expectForbidden(t, deleteNode2NormalPod(nodeanonClient))
-	expectForbidden(t, deleteNode2MirrorPod(nodeanonClient))
 	expectForbidden(t, createNode2MirrorPodEviction(nodeanonClient))
 	expectForbidden(t, createNode2(nodeanonClient))
 	expectForbidden(t, updateNode2Status(nodeanonClient))
@@ -476,8 +484,6 @@ func TestNodeAuthorizer(t *testing.T) {
 	expectForbidden(t, getPVC(node1Client))
 	expectForbidden(t, getPV(node1Client))
 	expectForbidden(t, createNode2NormalPod(nodeanonClient))
-	expectForbidden(t, createNode2MirrorPod(node1Client))
-	expectNotFound(t, deleteNode2MirrorPod(node1Client))
 	expectNotFound(t, createNode2MirrorPodEviction(node1Client))
 	expectForbidden(t, createNode2(node1Client))
 	expectNotFound(t, updateNode2Status(node1Client))
@@ -492,21 +498,23 @@ func TestNodeAuthorizer(t *testing.T) {
 
 	expectForbidden(t, createNode2NormalPod(nodeanonClient))
 	// mirror pod and self node lifecycle is allowed
+	expectAllowed(t, createNode2(node2Client))
+	expectAllowed(t, updateNode2Status(node2Client))
+	expectForbidden(t, createNode2MirrorPod(nodeanonClient))
+	expectForbidden(t, deleteNode2MirrorPod(nodeanonClient))
+	expectForbidden(t, createNode2MirrorPod(node1Client))
+	expectNotFound(t, deleteNode2MirrorPod(node1Client))
+	// create a pod as an admin to add object references
+	expectAllowed(t, createNode2NormalPod(superuserClient))
+
 	expectAllowed(t, createNode2MirrorPod(node2Client))
 	expectAllowed(t, deleteNode2MirrorPod(node2Client))
 	expectAllowed(t, createNode2MirrorPod(node2Client))
 	expectAllowed(t, createNode2MirrorPodEviction(node2Client))
-	expectAllowed(t, createNode2(node2Client))
-	expectAllowed(t, updateNode2Status(node2Client))
 	// self deletion is not allowed
 	expectForbidden(t, deleteNode2(node2Client))
 	// modification of another node's status is not allowed
 	expectForbidden(t, updateNode2Status(node1Client))
-	// clean up node2
-	expectAllowed(t, deleteNode2(superuserClient))
-
-	// create a pod as an admin to add object references
-	expectAllowed(t, createNode2NormalPod(superuserClient))
 
 	// unidentifiable node and node1 are still forbidden
 	expectForbidden(t, getSecret(nodeanonClient))
@@ -553,6 +561,8 @@ func TestNodeAuthorizer(t *testing.T) {
 	expectAllowed(t, createNode2MirrorPod(superuserClient))
 	expectAllowed(t, createNode2NormalPodEviction(node2Client))
 	expectAllowed(t, createNode2MirrorPodEviction(node2Client))
+	// clean up node2
+	expectAllowed(t, deleteNode2(superuserClient))
 
 	// re-create a pod as an admin to add object references
 	expectAllowed(t, createNode2NormalPod(superuserClient))

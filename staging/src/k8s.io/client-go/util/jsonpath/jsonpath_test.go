@@ -263,6 +263,8 @@ func TestStructInput(t *testing.T) {
 		{"allarray", "{.Book[*].Author}", storeData, "Nigel Rees Evelyn Waugh Herman Melville", false},
 		{"allfields", `{range .Bicycle[*]}{ "{" }{ @.* }{ "} " }{end}`, storeData, "{red 19.95 true} {green 20.01 false} ", false},
 		{"recurfields", "{..Price}", storeData, "8.95 12.99 8.99 19.95 20.01", false},
+		{"recurdotfields", "{...Price}", storeData, "8.95 12.99 8.99 19.95 20.01", false},
+		{"superrecurfields", "{............................................................Price}", storeData, "", true},
 		{"allstructsSlice", "{.Bicycle}", storeData,
 			`[{"Color":"red","Price":19.95,"IsNew":true},{"Color":"green","Price":20.01,"IsNew":false}]`, false},
 		{"allstructs", `{range .Bicycle[*]}{ @ }{ " " }{end}`, storeData,
@@ -278,6 +280,7 @@ func TestStructInput(t *testing.T) {
 
 	missingKeyTests := []jsonpathTest{
 		{"nonexistent field", "{.hello}", storeData, "", false},
+		{"nonexistent field 2", "before-{.hello}after", storeData, "before-after", false},
 	}
 	testJSONPath(missingKeyTests, true, t)
 
@@ -389,6 +392,21 @@ func TestKubernetes(t *testing.T) {
 		{"recursive name", "{..name}", nodesData, `127.0.0.1 127.0.0.2 myself e2e`, false},
 	}
 	testJSONPathSortOutput(randomPrintOrderTests, t)
+}
+
+func TestEmptyRange(t *testing.T) {
+	var input = []byte(`{"items":[]}`)
+	var emptyList interface{}
+	err := json.Unmarshal(input, &emptyList)
+	if err != nil {
+		t.Error(err)
+	}
+
+	tests := []jsonpathTest{
+		{"empty range", `{range .items[*]}{.metadata.name}{end}`, &emptyList, "", false},
+		{"empty nested range", `{range .items[*]}{.metadata.name}{":"}{range @.spec.containers[*]}{.name}{","}{end}{"+"}{end}`, &emptyList, "", false},
+	}
+	testJSONPath(tests, true, t)
 }
 
 func TestNestedRanges(t *testing.T) {
@@ -739,6 +757,64 @@ func TestNegativeIndex(t *testing.T) {
 			},
 		},
 		false,
+		t,
+	)
+}
+
+func TestRunningPodsJSONPathOutput(t *testing.T) {
+	var input = []byte(`{
+		"kind": "List",
+		"items": [
+			{
+				"kind": "Pod",
+				"metadata": {
+					"name": "pod1"
+				},
+				"status": {
+						"phase": "Running"
+				}
+			},
+			{
+				"kind": "Pod",
+				"metadata": {
+					"name": "pod2"
+				},
+				"status": {
+						"phase": "Running"
+				}
+			},
+			{
+				"kind": "Pod",
+				"metadata": {
+					"name": "pod3"
+				},
+				"status": {
+						"phase": "Running"
+				}
+			},
+           		{
+				"resourceVersion": "",
+				"selfLink": ""
+			}
+		]
+	}`)
+	var data interface{}
+	err := json.Unmarshal(input, &data)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	testJSONPath(
+		[]jsonpathTest{
+			{
+				"range over pods without selecting the last one",
+				`{range .items[?(.status.phase=="Running")]}{.metadata.name}{" is Running\n"}{end}`,
+				data,
+				"pod1 is Running\npod2 is Running\npod3 is Running\n",
+				false, // expect no error
+			},
+		},
+		true, // allow missing keys
 		t,
 	)
 }

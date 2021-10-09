@@ -17,88 +17,55 @@ limitations under the License.
 package logs
 
 import (
-	"flag"
-	"fmt"
-	"strings"
-
-	"github.com/go-logr/logr"
 	"github.com/spf13/pflag"
 
 	"k8s.io/klog/v2"
-)
 
-const (
-	logFormatFlagName = "logging-format"
-	defaultLogFormat  = "text"
+	"k8s.io/component-base/config"
+	"k8s.io/component-base/config/v1alpha1"
+	"k8s.io/component-base/logs/registry"
+	"k8s.io/component-base/logs/sanitization"
 )
-
-// List of logs (k8s.io/klog + k8s.io/component-base/logs) flags supported by all logging formats
-var supportedLogsFlags = map[string]struct{}{
-	"v":       {},
-	"vmodule": {},
-}
 
 // Options has klog format parameters
 type Options struct {
-	LogFormat string
+	Config config.LoggingConfiguration
 }
 
 // NewOptions return new klog options
 func NewOptions() *Options {
-	return &Options{
-		LogFormat: defaultLogFormat,
-	}
+	c := v1alpha1.LoggingConfiguration{}
+	v1alpha1.RecommendedLoggingConfiguration(&c)
+	o := &Options{}
+	v1alpha1.Convert_v1alpha1_LoggingConfiguration_To_config_LoggingConfiguration(&c, &o.Config, nil)
+	return o
 }
 
-// Validate check LogFormat in registry or not
+// Validate verifies if any unsupported flag is set
+// for non-default logging format
 func (o *Options) Validate() []error {
-	if _, err := o.Get(); err != nil {
-		return []error{fmt.Errorf("unsupported log format: %s", o.LogFormat)}
+	errs := ValidateLoggingConfiguration(&o.Config, nil)
+	if len(errs) != 0 {
+		return errs.ToAggregate().Errors()
 	}
 	return nil
 }
 
 // AddFlags add logging-format flag
 func (o *Options) AddFlags(fs *pflag.FlagSet) {
-	unsupportedFlags := fmt.Sprintf("--%s", strings.Join(unsupportedLoggingFlags(), ", --"))
-	formats := fmt.Sprintf(`"%s"`, strings.Join(logRegistry.List(), `", "`))
-	fs.StringVar(&o.LogFormat, logFormatFlagName, defaultLogFormat, fmt.Sprintf("Sets the log format. Permitted formats: %s.\nNon-default formats don't honor these flags: %s.\nNon-default choices are currently alpha and subject to change without warning.", formats, unsupportedFlags))
-
-	// No new log formats should be added after generation is of flag options
-	logRegistry.Freeze()
+	BindLoggingFlags(&o.Config, fs)
 }
 
 // Apply set klog logger from LogFormat type
 func (o *Options) Apply() {
 	// if log format not exists, use nil loggr
-	loggr, _ := o.Get()
-	klog.SetLogger(loggr)
-}
-
-// Get logger with LogFormat field
-func (o *Options) Get() (logr.Logger, error) {
-	return logRegistry.Get(o.LogFormat)
-}
-
-func unsupportedLoggingFlags() []string {
-	allFlags := []string{}
-
-	// k8s.io/klog flags
-	fs := &flag.FlagSet{}
-	klog.InitFlags(fs)
-	fs.VisitAll(func(flag *flag.Flag) {
-		if _, found := supportedLogsFlags[flag.Name]; !found {
-			allFlags = append(allFlags, flag.Name)
-		}
-	})
-
-	// k8s.io/component-base/logs flags
-	pfs := &pflag.FlagSet{}
-	AddFlags(pfs)
-	pfs.VisitAll(func(flag *pflag.Flag) {
-		if _, found := supportedLogsFlags[flag.Name]; !found {
-			allFlags = append(allFlags, flag.Name)
-		}
-	})
-	return allFlags
+	factory, _ := registry.LogRegistry.Get(o.Config.Format)
+	if factory == nil {
+		klog.ClearLogger()
+	} else {
+		klog.SetLogger(factory.Create())
+	}
+	if o.Config.Sanitization {
+		klog.SetLogFilter(&sanitization.SanitizingFilter{})
+	}
 }

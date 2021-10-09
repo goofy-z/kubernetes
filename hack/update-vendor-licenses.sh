@@ -196,6 +196,26 @@ for PACKAGE in $(go list -m -json all | jq -r .Path | sort -f); do
     echo "${PACKAGE} doesn't exist in ${DEPS_DIR}, skipping" >&2
     continue
   fi
+  # Skip a directory if 1) it has no files and 2) all the subdirectories contain a go.mod file.
+  misses_go_mod=false
+  DEPS_SUBDIR="${DEPS_DIR}/${PACKAGE}"
+  search_for_mods () {
+    if [[ -z "$(find "${DEPS_SUBDIR}/" -mindepth 1 -maxdepth 1 -type f)" ]]; then
+      while read -d "" -r SUBDIR; do
+          if [[ ! -e "${SUBDIR}/go.mod" ]]; then
+              DEPS_SUBDIR=${SUBDIR}
+              search_for_mods
+          fi
+      done < <(find "${DEPS_SUBDIR}/" -mindepth 1 -maxdepth 1 -type d -print0)
+    else
+      misses_go_mod=true
+    fi
+  }
+  search_for_mods
+  if [[ $misses_go_mod = false ]]; then
+      echo "${PACKAGE} has no files, skipping" >&2
+      continue
+  fi
   echo "${PACKAGE}"
 
   process_content "${PACKAGE}" LICENSE
@@ -239,7 +259,14 @@ __EOF__
   mv "${TMP_LICENSE_FILE}" "${dest_dir}/LICENSE"
 done
 
+# copy licenses for forked code from vendor and third_party directories
+(cd "${KUBE_ROOT}" && \
+  find vendor third_party -iname 'licen[sc]e*' -o -iname 'notice*' -o -iname 'copying*' | \
+  grep -E 'third_party|forked' | \
+  xargs tar -czf - | tar -C "${TMP_LICENSES_DIR}" -xzf -)
+
 # Leave things like OWNERS alone.
 rm -f "${LICENSES_DIR}/LICENSE"
 rm -rf "${LICENSES_DIR}/vendor"
+rm -rf "${LICENSES_DIR}/third_party"
 mv "${TMP_LICENSES_DIR}"/* "${LICENSES_DIR}"

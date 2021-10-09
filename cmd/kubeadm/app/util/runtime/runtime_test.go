@@ -26,9 +26,10 @@ import (
 
 	"github.com/pkg/errors"
 
-	"k8s.io/kubernetes/cmd/kubeadm/app/constants"
 	"k8s.io/utils/exec"
 	fakeexec "k8s.io/utils/exec/testing"
+
+	"k8s.io/kubernetes/cmd/kubeadm/app/constants"
 )
 
 func TestNewContainerRuntime(t *testing.T) {
@@ -185,8 +186,9 @@ func TestRemoveContainers(t *testing.T) {
 			fakeOK, fakeOK, fakeOK, fakeOK, fakeOK, fakeOK, // Test case 1
 			fakeOK, fakeOK, fakeOK, fakeErr, fakeOK, fakeOK,
 			fakeErr, fakeOK, fakeOK, fakeErr, fakeOK,
-			fakeOK, fakeOK, fakeOK,
-			fakeOK, fakeErr, fakeOK,
+			fakeOK, fakeOK, fakeOK, fakeOK, fakeOK, fakeOK,
+			fakeOK, fakeOK, fakeOK, fakeErr, fakeOK, fakeOK,
+			fakeErr, fakeOK, fakeOK, fakeErr, fakeOK,
 		},
 	}
 	execer := fakeexec.FakeExec{
@@ -204,7 +206,8 @@ func TestRemoveContainers(t *testing.T) {
 		{"invalid: CRI rmp failure", "unix:///var/run/crio/crio.sock", []string{"k8s_p1", "k8s_p2", "k8s_p3"}, true},
 		{"invalid: CRI stopp failure", "unix:///var/run/crio/crio.sock", []string{"k8s_p1", "k8s_p2", "k8s_p3"}, true},
 		{"valid: remove containers using docker", constants.DefaultDockerCRISocket, []string{"k8s_c1", "k8s_c2", "k8s_c3"}, false},
-		{"invalid: remove containers using docker", constants.DefaultDockerCRISocket, []string{"k8s_c1", "k8s_c2", "k8s_c3"}, true},
+		{"invalid: docker rm failure", constants.DefaultDockerCRISocket, []string{"k8s_c1", "k8s_c2", "k8s_c3"}, true},
+		{"invalid: docker stop failure", constants.DefaultDockerCRISocket, []string{"k8s_c1", "k8s_c2", "k8s_c3"}, true},
 	}
 
 	for _, tc := range cases {

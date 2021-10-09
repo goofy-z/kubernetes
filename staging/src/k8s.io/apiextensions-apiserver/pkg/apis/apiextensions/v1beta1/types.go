@@ -200,6 +200,17 @@ type CustomResourceDefinitionVersion struct {
 	// storage indicates this version should be used when persisting custom resources to storage.
 	// There must be exactly one version with storage=true.
 	Storage bool `json:"storage" protobuf:"varint,3,opt,name=storage"`
+	// deprecated indicates this version of the custom resource API is deprecated.
+	// When set to true, API requests to this version receive a warning header in the server response.
+	// Defaults to false.
+	// +optional
+	Deprecated bool `json:"deprecated,omitempty" protobuf:"varint,7,opt,name=deprecated"`
+	// deprecationWarning overrides the default warning returned to API clients.
+	// May only be set when `deprecated` is true.
+	// The default warning indicates this version is deprecated and recommends use
+	// of the newest served version of equal or greater stability, if one exists.
+	// +optional
+	DeprecationWarning *string `json:"deprecationWarning,omitempty" protobuf:"bytes,8,opt,name=deprecationWarning"`
 	// schema describes the schema used for validation and pruning of this version of the custom resource.
 	// Top-level and per-version schemas are mutually exclusive.
 	// Per-version schemas must not all be set to identical values (top-level validation schema should be used instead).
@@ -350,6 +361,8 @@ type CustomResourceDefinitionCondition struct {
 type CustomResourceDefinitionStatus struct {
 	// conditions indicate state for particular aspects of a CustomResourceDefinition
 	// +optional
+	// +listType=map
+	// +listMapKey=type
 	Conditions []CustomResourceDefinitionCondition `json:"conditions" protobuf:"bytes,1,opt,name=conditions"`
 
 	// acceptedNames are the names that are actually being used to serve discovery.
@@ -383,7 +396,10 @@ const CustomResourceCleanupFinalizer = "customresourcecleanup.apiextensions.k8s.
 // <.spec.name>.<.spec.group>.
 // Deprecated in v1.16, planned for removal in v1.22. Use apiextensions.k8s.io/v1 CustomResourceDefinition instead.
 type CustomResourceDefinition struct {
-	metav1.TypeMeta   `json:",inline"`
+	metav1.TypeMeta `json:",inline"`
+	// Standard object's metadata
+	// More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#metadata
+	// +optional
 	metav1.ObjectMeta `json:"metadata,omitempty" protobuf:"bytes,1,opt,name=metadata"`
 
 	// spec describes how the user wants the resources to appear
@@ -395,12 +411,17 @@ type CustomResourceDefinition struct {
 
 // +k8s:deepcopy-gen:interfaces=k8s.io/apimachinery/pkg/runtime.Object
 // +k8s:prerelease-lifecycle-gen:introduced=1.7
-// +k8s:prerelease-lifecycle-gen:deprecated=1.19
+// +k8s:prerelease-lifecycle-gen:deprecated=1.16
+// +k8s:prerelease-lifecycle-gen:removed=1.22
 // +k8s:prerelease-lifecycle-gen:replacement=apiextensions.k8s.io,v1,CustomResourceDefinitionList
 
 // CustomResourceDefinitionList is a list of CustomResourceDefinition objects.
 type CustomResourceDefinitionList struct {
 	metav1.TypeMeta `json:",inline"`
+
+	// Standard object's metadata
+	// More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#metadata
+	// +optional
 	metav1.ListMeta `json:"metadata,omitempty" protobuf:"bytes,1,opt,name=metadata"`
 
 	// items list individual CustomResourceDefinition objects

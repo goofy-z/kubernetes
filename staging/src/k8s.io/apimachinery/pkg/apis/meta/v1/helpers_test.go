@@ -93,6 +93,26 @@ func TestLabelSelectorAsSelector(t *testing.T) {
 	}
 }
 
+func BenchmarkLabelSelectorAsSelector(b *testing.B) {
+	selector := &LabelSelector{
+		MatchLabels: map[string]string{
+			"foo": "foo",
+			"bar": "bar",
+		},
+		MatchExpressions: []LabelSelectorRequirement{{
+			Key:      "baz",
+			Operator: LabelSelectorOpExists,
+		}},
+	}
+	b.StartTimer()
+	for i := 0; i < b.N; i++ {
+		_, err := LabelSelectorAsSelector(selector)
+		if err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
 func TestLabelSelectorAsMap(t *testing.T) {
 	matchLabels := map[string]string{"foo": "bar"}
 	matchExpressions := func(operator LabelSelectorOperator, values []string) []LabelSelectorRequirement {
@@ -193,5 +213,40 @@ func TestResetObjectMetaForStatus(t *testing.T) {
 
 	if !reflect.DeepEqual(meta, existingMeta) {
 		t.Error(diff.ObjectDiff(meta, existingMeta))
+	}
+}
+
+func TestSetMetaDataLabel(t *testing.T) {
+	tests := []struct {
+		obj   *ObjectMeta
+		label string
+		value string
+		want  map[string]string
+	}{
+		{
+			obj:   &ObjectMeta{},
+			label: "foo",
+			value: "bar",
+			want:  map[string]string{"foo": "bar"},
+		},
+		{
+			obj:   &ObjectMeta{Labels: map[string]string{"foo": "bar"}},
+			label: "foo",
+			value: "baz",
+			want:  map[string]string{"foo": "baz"},
+		},
+		{
+			obj:   &ObjectMeta{Labels: map[string]string{"foo": "bar"}},
+			label: "version",
+			value: "1.0.0",
+			want:  map[string]string{"foo": "bar", "version": "1.0.0"},
+		},
+	}
+
+	for _, tc := range tests {
+		SetMetaDataLabel(tc.obj, tc.label, tc.value)
+		if !reflect.DeepEqual(tc.obj.Labels, tc.want) {
+			t.Errorf("got %v, want %v", tc.obj.Labels, tc.want)
+		}
 	}
 }

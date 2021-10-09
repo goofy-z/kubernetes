@@ -1,3 +1,4 @@
+//go:build !providerless
 // +build !providerless
 
 /*
@@ -20,6 +21,7 @@ package gce
 
 import (
 	"context"
+	"fmt"
 	"strings"
 
 	compute "google.golang.org/api/compute/v1"
@@ -79,7 +81,9 @@ func (g *Cloud) ListZonesInRegion(region string) ([]*compute.Zone, error) {
 	defer cancel()
 
 	mc := newZonesMetricContext("list", region)
-	list, err := g.c.Zones().List(ctx, filter.Regexp("region", g.getRegionLink(region)))
+	// Use regex match instead of an exact regional link constructed from getRegionalLink below.
+	// See comments in issue kubernetes/kubernetes#87905
+	list, err := g.c.Zones().List(ctx, filter.Regexp("region", fmt.Sprintf(".*/regions/%s", region)))
 	if err != nil {
 		return nil, mc.Observe(err)
 	}
@@ -87,5 +91,5 @@ func (g *Cloud) ListZonesInRegion(region string) ([]*compute.Zone, error) {
 }
 
 func (g *Cloud) getRegionLink(region string) string {
-	return g.service.BasePath + strings.Join([]string{g.projectID, "regions", region}, "/")
+	return g.projectsBasePath + strings.Join([]string{g.projectID, "regions", region}, "/")
 }

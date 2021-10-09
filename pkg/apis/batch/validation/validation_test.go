@@ -20,14 +20,18 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/google/go-cmp/cmp"
+	"github.com/google/go-cmp/cmp/cmpopts"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
-	utilfeature "k8s.io/apiserver/pkg/util/feature"
-	featuregatetesting "k8s.io/component-base/featuregate/testing"
+	"k8s.io/apimachinery/pkg/util/validation/field"
 	"k8s.io/kubernetes/pkg/apis/batch"
 	api "k8s.io/kubernetes/pkg/apis/core"
-	"k8s.io/kubernetes/pkg/features"
+	corevalidation "k8s.io/kubernetes/pkg/apis/core/validation"
+	"k8s.io/utils/pointer"
 )
+
+var ignoreErrValueDetail = cmpopts.IgnoreFields(field.Error{}, "BadValue", "Detail")
 
 func getValidManualSelector() *metav1.LabelSelector {
 	return &metav1.LabelSelector{
@@ -73,35 +77,94 @@ func TestValidateJob(t *testing.T) {
 	validGeneratedSelector := getValidGeneratedSelector()
 	validPodTemplateSpecForGenerated := getValidPodTemplateSpecForGenerated(validGeneratedSelector)
 
-	successCases := map[string]batch.Job{
-		"manual selector": {
-			ObjectMeta: metav1.ObjectMeta{
-				Name:      "myjob",
-				Namespace: metav1.NamespaceDefault,
-				UID:       types.UID("1a2b3c"),
-			},
-			Spec: batch.JobSpec{
-				Selector:       validManualSelector,
-				ManualSelector: newBool(true),
-				Template:       validPodTemplateSpecForManual,
+	successCases := map[string]struct {
+		opts JobValidationOptions
+		job  batch.Job
+	}{
+		"valid manual selector": {
+			job: batch.Job{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:        "myjob",
+					Namespace:   metav1.NamespaceDefault,
+					UID:         types.UID("1a2b3c"),
+					Annotations: map[string]string{"foo": "bar"},
+				},
+				Spec: batch.JobSpec{
+					Selector:       validManualSelector,
+					ManualSelector: pointer.BoolPtr(true),
+					Template:       validPodTemplateSpecForManual,
+				},
 			},
 		},
-		"generated selector": {
-			ObjectMeta: metav1.ObjectMeta{
-				Name:      "myjob",
-				Namespace: metav1.NamespaceDefault,
-				UID:       types.UID("1a2b3c"),
+		"valid generated selector": {
+			job: batch.Job{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "myjob",
+					Namespace: metav1.NamespaceDefault,
+					UID:       types.UID("1a2b3c"),
+				},
+				Spec: batch.JobSpec{
+					Selector: validGeneratedSelector,
+					Template: validPodTemplateSpecForGenerated,
+				},
 			},
-			Spec: batch.JobSpec{
-				Selector: validGeneratedSelector,
-				Template: validPodTemplateSpecForGenerated,
+		},
+		"valid NonIndexed completion mode": {
+			job: batch.Job{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "myjob",
+					Namespace: metav1.NamespaceDefault,
+					UID:       types.UID("1a2b3c"),
+				},
+				Spec: batch.JobSpec{
+					Selector:       validGeneratedSelector,
+					Template:       validPodTemplateSpecForGenerated,
+					CompletionMode: completionModePtr(batch.NonIndexedCompletion),
+				},
+			},
+		},
+		"valid Indexed completion mode": {
+			job: batch.Job{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "myjob",
+					Namespace: metav1.NamespaceDefault,
+					UID:       types.UID("1a2b3c"),
+				},
+				Spec: batch.JobSpec{
+					Selector:       validGeneratedSelector,
+					Template:       validPodTemplateSpecForGenerated,
+					CompletionMode: completionModePtr(batch.IndexedCompletion),
+					Completions:    pointer.Int32Ptr(2),
+					Parallelism:    pointer.Int32Ptr(100000),
+				},
+			},
+		},
+		"valid job tracking annotation": {
+			opts: JobValidationOptions{
+				AllowTrackingAnnotation: true,
+			},
+			job: batch.Job{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "myjob",
+					Namespace: metav1.NamespaceDefault,
+					UID:       types.UID("1a2b3c"),
+					Annotations: map[string]string{
+						batch.JobTrackingFinalizer: "",
+					},
+				},
+				Spec: batch.JobSpec{
+					Selector: validGeneratedSelector,
+					Template: validPodTemplateSpecForGenerated,
+				},
 			},
 		},
 	}
 	for k, v := range successCases {
-		if errs := ValidateJob(&v); len(errs) != 0 {
-			t.Errorf("expected success for %s: %v", k, errs)
-		}
+		t.Run(k, func(t *testing.T) {
+			if errs := ValidateJob(&v.job, v.opts); len(errs) != 0 {
+				t.Errorf("Got unexpected validation errors: %v", errs)
+			}
+		})
 	}
 	negative := int32(-1)
 	negative64 := int64(-1)
@@ -152,7 +215,7 @@ func TestValidateJob(t *testing.T) {
 				Template: validPodTemplateSpecForGenerated,
 			},
 		},
-		"spec.template.metadata.labels: Invalid value: {\"y\":\"z\"}: `selector` does not match template `labels`": {
+		"spec.template.metadata.labels: Invalid value: map[string]string{\"y\":\"z\"}: `selector` does not match template `labels`": {
 			ObjectMeta: metav1.ObjectMeta{
 				Name:      "myjob",
 				Namespace: metav1.NamespaceDefault,
@@ -160,7 +223,7 @@ func TestValidateJob(t *testing.T) {
 			},
 			Spec: batch.JobSpec{
 				Selector:       validManualSelector,
-				ManualSelector: newBool(true),
+				ManualSelector: pointer.BoolPtr(true),
 				Template: api.PodTemplateSpec{
 					ObjectMeta: metav1.ObjectMeta{
 						Labels: map[string]string{"y": "z"},
@@ -173,7 +236,7 @@ func TestValidateJob(t *testing.T) {
 				},
 			},
 		},
-		"spec.template.metadata.labels: Invalid value: {\"controller-uid\":\"4d5e6f\"}: `selector` does not match template `labels`": {
+		"spec.template.metadata.labels: Invalid value: map[string]string{\"controller-uid\":\"4d5e6f\"}: `selector` does not match template `labels`": {
 			ObjectMeta: metav1.ObjectMeta{
 				Name:      "myjob",
 				Namespace: metav1.NamespaceDefault,
@@ -181,13 +244,34 @@ func TestValidateJob(t *testing.T) {
 			},
 			Spec: batch.JobSpec{
 				Selector:       validManualSelector,
-				ManualSelector: newBool(true),
+				ManualSelector: pointer.BoolPtr(true),
 				Template: api.PodTemplateSpec{
 					ObjectMeta: metav1.ObjectMeta{
 						Labels: map[string]string{"controller-uid": "4d5e6f"},
 					},
 					Spec: api.PodSpec{
 						RestartPolicy: api.RestartPolicyOnFailure,
+						DNSPolicy:     api.DNSClusterFirst,
+						Containers:    []api.Container{{Name: "abc", Image: "image", ImagePullPolicy: "IfNotPresent", TerminationMessagePolicy: api.TerminationMessageReadFile}},
+					},
+				},
+			},
+		},
+		"spec.template.spec.restartPolicy: Required value": {
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      "myjob",
+				Namespace: metav1.NamespaceDefault,
+				UID:       types.UID("1a2b3c"),
+			},
+			Spec: batch.JobSpec{
+				Selector:       validManualSelector,
+				ManualSelector: pointer.BoolPtr(true),
+				Template: api.PodTemplateSpec{
+					ObjectMeta: metav1.ObjectMeta{
+						Labels: validManualSelector.MatchLabels,
+					},
+					Spec: api.PodSpec{
+						RestartPolicy: api.RestartPolicyAlways,
 						DNSPolicy:     api.DNSClusterFirst,
 						Containers:    []api.Container{{Name: "abc", Image: "image", ImagePullPolicy: "IfNotPresent", TerminationMessagePolicy: api.TerminationMessageReadFile}},
 					},
@@ -202,66 +286,213 @@ func TestValidateJob(t *testing.T) {
 			},
 			Spec: batch.JobSpec{
 				Selector:       validManualSelector,
-				ManualSelector: newBool(true),
+				ManualSelector: pointer.BoolPtr(true),
 				Template: api.PodTemplateSpec{
 					ObjectMeta: metav1.ObjectMeta{
 						Labels: validManualSelector.MatchLabels,
 					},
 					Spec: api.PodSpec{
-						RestartPolicy: api.RestartPolicyAlways,
+						RestartPolicy: "Invalid",
 						DNSPolicy:     api.DNSClusterFirst,
 						Containers:    []api.Container{{Name: "abc", Image: "image", ImagePullPolicy: "IfNotPresent", TerminationMessagePolicy: api.TerminationMessageReadFile}},
 					},
 				},
 			},
 		},
+		"spec.ttlSecondsAfterFinished: must be greater than or equal to 0": {
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      "myjob",
+				Namespace: metav1.NamespaceDefault,
+				UID:       types.UID("1a2b3c"),
+			},
+			Spec: batch.JobSpec{
+				TTLSecondsAfterFinished: &negative,
+				Selector:                validGeneratedSelector,
+				Template:                validPodTemplateSpecForGenerated,
+			},
+		},
+		"spec.completions: Required value: when completion mode is Indexed": {
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      "myjob",
+				Namespace: metav1.NamespaceDefault,
+				UID:       types.UID("1a2b3c"),
+			},
+			Spec: batch.JobSpec{
+				Selector:       validGeneratedSelector,
+				Template:       validPodTemplateSpecForGenerated,
+				CompletionMode: completionModePtr(batch.IndexedCompletion),
+			},
+		},
+		"spec.parallelism: must be less than or equal to 100000 when completion mode is Indexed": {
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      "myjob",
+				Namespace: metav1.NamespaceDefault,
+				UID:       types.UID("1a2b3c"),
+			},
+			Spec: batch.JobSpec{
+				Selector:       validGeneratedSelector,
+				Template:       validPodTemplateSpecForGenerated,
+				CompletionMode: completionModePtr(batch.IndexedCompletion),
+				Completions:    pointer.Int32Ptr(2),
+				Parallelism:    pointer.Int32Ptr(100001),
+			},
+		},
+		"metadata.annotations[batch.kubernetes.io/job-tracking]: cannot add this annotation": {
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      "myjob",
+				Namespace: metav1.NamespaceDefault,
+				UID:       types.UID("1a2b3c"),
+				Annotations: map[string]string{
+					batch.JobTrackingFinalizer: "",
+				},
+			},
+			Spec: batch.JobSpec{
+				Selector: validGeneratedSelector,
+				Template: validPodTemplateSpecForGenerated,
+			},
+		},
 	}
 
-	for _, setFeature := range []bool{true, false} {
-		defer featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, features.TTLAfterFinished, setFeature)()
-		ttlCase := "spec.ttlSecondsAfterFinished:must be greater than or equal to 0"
-		if utilfeature.DefaultFeatureGate.Enabled(features.TTLAfterFinished) {
-			errorCases[ttlCase] = batch.Job{
-				ObjectMeta: metav1.ObjectMeta{
-					Name:      "myjob",
-					Namespace: metav1.NamespaceDefault,
-					UID:       types.UID("1a2b3c"),
-				},
-				Spec: batch.JobSpec{
-					TTLSecondsAfterFinished: &negative,
-					Selector:                validGeneratedSelector,
-					Template:                validPodTemplateSpecForGenerated,
-				},
-			}
-		} else {
-			delete(errorCases, ttlCase)
-		}
-
-		for k, v := range errorCases {
-			errs := ValidateJob(&v)
+	for k, v := range errorCases {
+		t.Run(k, func(t *testing.T) {
+			errs := ValidateJob(&v, JobValidationOptions{})
 			if len(errs) == 0 {
 				t.Errorf("expected failure for %s", k)
 			} else {
-				s := strings.Split(k, ":")
+				s := strings.SplitN(k, ":", 2)
 				err := errs[0]
 				if err.Field != s[0] || !strings.Contains(err.Error(), s[1]) {
 					t.Errorf("unexpected error: %v, expected: %s", err, k)
 				}
 			}
-		}
+		})
+	}
+}
+
+func TestValidateJobUpdate(t *testing.T) {
+	validGeneratedSelector := getValidGeneratedSelector()
+	validPodTemplateSpecForGenerated := getValidPodTemplateSpecForGenerated(validGeneratedSelector)
+	cases := map[string]struct {
+		old    batch.Job
+		update func(*batch.Job)
+		err    *field.Error
+	}{
+		"mutable fields": {
+			old: batch.Job{
+				ObjectMeta: metav1.ObjectMeta{Name: "abc", Namespace: metav1.NamespaceDefault},
+				Spec: batch.JobSpec{
+					Selector:                validGeneratedSelector,
+					Template:                validPodTemplateSpecForGenerated,
+					Parallelism:             pointer.Int32Ptr(5),
+					ActiveDeadlineSeconds:   pointer.Int64Ptr(2),
+					TTLSecondsAfterFinished: pointer.Int32Ptr(1),
+				},
+			},
+			update: func(job *batch.Job) {
+				job.Spec.Parallelism = pointer.Int32Ptr(2)
+				job.Spec.ActiveDeadlineSeconds = pointer.Int64Ptr(3)
+				job.Spec.TTLSecondsAfterFinished = pointer.Int32Ptr(2)
+				job.Spec.ManualSelector = pointer.BoolPtr(true)
+			},
+		},
+		"immutable completion": {
+			old: batch.Job{
+				ObjectMeta: metav1.ObjectMeta{Name: "abc", Namespace: metav1.NamespaceDefault},
+				Spec: batch.JobSpec{
+					Selector: validGeneratedSelector,
+					Template: validPodTemplateSpecForGenerated,
+				},
+			},
+			update: func(job *batch.Job) {
+				job.Spec.Completions = pointer.Int32Ptr(1)
+			},
+			err: &field.Error{
+				Type:  field.ErrorTypeInvalid,
+				Field: "spec.completions",
+			},
+		},
+		"immutable selector": {
+			old: batch.Job{
+				ObjectMeta: metav1.ObjectMeta{Name: "abc", Namespace: metav1.NamespaceDefault},
+				Spec: batch.JobSpec{
+					Selector: validGeneratedSelector,
+					Template: validPodTemplateSpecForGenerated,
+				},
+			},
+			update: func(job *batch.Job) {
+				job.Spec.Selector.MatchLabels["foo"] = "bar"
+			},
+			err: &field.Error{
+				Type:  field.ErrorTypeInvalid,
+				Field: "spec.selector",
+			},
+		},
+		"immutable pod template": {
+			old: batch.Job{
+				ObjectMeta: metav1.ObjectMeta{Name: "abc", Namespace: metav1.NamespaceDefault},
+				Spec: batch.JobSpec{
+					Selector: validGeneratedSelector,
+					Template: validPodTemplateSpecForGenerated,
+				},
+			},
+			update: func(job *batch.Job) {
+				job.Spec.Template.Spec.Containers = nil
+			},
+			err: &field.Error{
+				Type:  field.ErrorTypeInvalid,
+				Field: "spec.template",
+			},
+		},
+		"immutable completion mode": {
+			old: batch.Job{
+				ObjectMeta: metav1.ObjectMeta{Name: "abc", Namespace: metav1.NamespaceDefault},
+				Spec: batch.JobSpec{
+					Selector:       validGeneratedSelector,
+					Template:       validPodTemplateSpecForGenerated,
+					CompletionMode: completionModePtr(batch.IndexedCompletion),
+					Completions:    pointer.Int32Ptr(2),
+				},
+			},
+			update: func(job *batch.Job) {
+				job.Spec.CompletionMode = completionModePtr(batch.NonIndexedCompletion)
+			},
+			err: &field.Error{
+				Type:  field.ErrorTypeInvalid,
+				Field: "spec.completionMode",
+			},
+		},
+	}
+	ignoreValueAndDetail := cmpopts.IgnoreFields(field.Error{}, "BadValue", "Detail")
+	for k, tc := range cases {
+		t.Run(k, func(t *testing.T) {
+			tc.old.ResourceVersion = "1"
+			update := tc.old.DeepCopy()
+			tc.update(update)
+			errs := ValidateJobUpdate(&tc.old, update, corevalidation.PodValidationOptions{})
+			var wantErrs field.ErrorList
+			if tc.err != nil {
+				wantErrs = append(wantErrs, tc.err)
+			}
+			if diff := cmp.Diff(wantErrs, errs, ignoreValueAndDetail); diff != "" {
+				t.Errorf("Unexpected validation errors (-want,+got):\n%s", diff)
+			}
+		})
 	}
 }
 
 func TestValidateJobUpdateStatus(t *testing.T) {
-	type testcase struct {
-		old    batch.Job
-		update batch.Job
-	}
-
-	successCases := []testcase{
-		{
+	cases := map[string]struct {
+		old      batch.Job
+		update   batch.Job
+		wantErrs field.ErrorList
+	}{
+		"valid": {
 			old: batch.Job{
-				ObjectMeta: metav1.ObjectMeta{Name: "abc", Namespace: metav1.NamespaceDefault},
+				ObjectMeta: metav1.ObjectMeta{
+					Name:            "abc",
+					Namespace:       metav1.NamespaceDefault,
+					ResourceVersion: "1",
+				},
 				Status: batch.JobStatus{
 					Active:    1,
 					Succeeded: 2,
@@ -269,7 +500,11 @@ func TestValidateJobUpdateStatus(t *testing.T) {
 				},
 			},
 			update: batch.Job{
-				ObjectMeta: metav1.ObjectMeta{Name: "abc", Namespace: metav1.NamespaceDefault},
+				ObjectMeta: metav1.ObjectMeta{
+					Name:            "abc",
+					Namespace:       metav1.NamespaceDefault,
+					ResourceVersion: "1",
+				},
 				Status: batch.JobStatus{
 					Active:    1,
 					Succeeded: 1,
@@ -277,18 +512,7 @@ func TestValidateJobUpdateStatus(t *testing.T) {
 				},
 			},
 		},
-	}
-
-	for _, successCase := range successCases {
-		successCase.old.ObjectMeta.ResourceVersion = "1"
-		successCase.update.ObjectMeta.ResourceVersion = "1"
-		if errs := ValidateJobUpdateStatus(&successCase.update, &successCase.old); len(errs) != 0 {
-			t.Errorf("expected success: %v", errs)
-		}
-	}
-
-	errorCases := map[string]testcase{
-		"[status.active: Invalid value: -1: must be greater than or equal to 0, status.succeeded: Invalid value: -2: must be greater than or equal to 0]": {
+		"negative counts": {
 			old: batch.Job{
 				ObjectMeta: metav1.ObjectMeta{
 					Name:            "abc",
@@ -313,18 +537,48 @@ func TestValidateJobUpdateStatus(t *testing.T) {
 					Failed:    3,
 				},
 			},
+			wantErrs: field.ErrorList{
+				{Type: field.ErrorTypeInvalid, Field: "status.active"},
+				{Type: field.ErrorTypeInvalid, Field: "status.succeeded"},
+			},
+		},
+		"empty and duplicated uncounted pods": {
+			old: batch.Job{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:            "abc",
+					Namespace:       metav1.NamespaceDefault,
+					ResourceVersion: "5",
+				},
+			},
+			update: batch.Job{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:            "abc",
+					Namespace:       metav1.NamespaceDefault,
+					ResourceVersion: "5",
+				},
+				Status: batch.JobStatus{
+					UncountedTerminatedPods: &batch.UncountedTerminatedPods{
+						Succeeded: []types.UID{"a", "b", "c", "a", ""},
+						Failed:    []types.UID{"c", "d", "e", "d", ""},
+					},
+				},
+			},
+			wantErrs: field.ErrorList{
+				{Type: field.ErrorTypeDuplicate, Field: "status.uncountedTerminatedPods.succeeded[3]"},
+				{Type: field.ErrorTypeInvalid, Field: "status.uncountedTerminatedPods.succeeded[4]"},
+				{Type: field.ErrorTypeDuplicate, Field: "status.uncountedTerminatedPods.failed[0]"},
+				{Type: field.ErrorTypeDuplicate, Field: "status.uncountedTerminatedPods.failed[3]"},
+				{Type: field.ErrorTypeInvalid, Field: "status.uncountedTerminatedPods.failed[4]"},
+			},
 		},
 	}
-
-	for testName, errorCase := range errorCases {
-		errs := ValidateJobUpdateStatus(&errorCase.update, &errorCase.old)
-		if len(errs) == 0 {
-			t.Errorf("expected failure: %s", testName)
-			continue
-		}
-		if errs.ToAggregate().Error() != testName {
-			t.Errorf("expected '%s' got '%s'", errs.ToAggregate().Error(), testName)
-		}
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			errs := ValidateJobUpdateStatus(&tc.update, &tc.old)
+			if diff := cmp.Diff(tc.wantErrs, errs, ignoreErrValueDetail); diff != "" {
+				t.Errorf("Unexpected errors (-want,+got):\n%s", diff)
+			}
+		})
 	}
 }
 
@@ -368,7 +622,7 @@ func TestValidateCronJob(t *testing.T) {
 		},
 	}
 	for k, v := range successCases {
-		if errs := ValidateCronJob(&v); len(errs) != 0 {
+		if errs := ValidateCronJob(&v, corevalidation.PodValidationOptions{}); len(errs) != 0 {
 			t.Errorf("expected success for %s: %v", k, errs)
 		}
 
@@ -376,7 +630,7 @@ func TestValidateCronJob(t *testing.T) {
 		// copy to avoid polluting the testcase object, set a resourceVersion to allow validating update, and test a no-op update
 		v = *v.DeepCopy()
 		v.ResourceVersion = "1"
-		if errs := ValidateCronJobUpdate(&v, &v); len(errs) != 0 {
+		if errs := ValidateCronJobUpdate(&v, &v, corevalidation.PodValidationOptions{}); len(errs) != 0 {
 			t.Errorf("expected success for %s: %v", k, errs)
 		}
 	}
@@ -579,13 +833,13 @@ func TestValidateCronJob(t *testing.T) {
 				ConcurrencyPolicy: batch.AllowConcurrent,
 				JobTemplate: batch.JobTemplateSpec{
 					Spec: batch.JobSpec{
-						ManualSelector: newBool(true),
+						ManualSelector: pointer.BoolPtr(true),
 						Template:       validPodTemplateSpec,
 					},
 				},
 			},
 		},
-		"spec.jobTemplate.spec.template.spec.restartPolicy: Unsupported value": {
+		"spec.jobTemplate.spec.template.spec.restartPolicy: Required value": {
 			ObjectMeta: metav1.ObjectMeta{
 				Name:      "mycronjob",
 				Namespace: metav1.NamespaceDefault,
@@ -607,9 +861,7 @@ func TestValidateCronJob(t *testing.T) {
 				},
 			},
 		},
-	}
-	if utilfeature.DefaultFeatureGate.Enabled(features.TTLAfterFinished) {
-		errorCases["spec.jobTemplate.spec.ttlSecondsAfterFinished:must be greater than or equal to 0"] = batch.CronJob{
+		"spec.jobTemplate.spec.template.spec.restartPolicy: Unsupported value": {
 			ObjectMeta: metav1.ObjectMeta{
 				Name:      "mycronjob",
 				Namespace: metav1.NamespaceDefault,
@@ -620,16 +872,38 @@ func TestValidateCronJob(t *testing.T) {
 				ConcurrencyPolicy: batch.AllowConcurrent,
 				JobTemplate: batch.JobTemplateSpec{
 					Spec: batch.JobSpec{
-						TTLSecondsAfterFinished: &negative,
-						Template:                validPodTemplateSpec,
+						Template: api.PodTemplateSpec{
+							Spec: api.PodSpec{
+								RestartPolicy: "Invalid",
+								DNSPolicy:     api.DNSClusterFirst,
+								Containers:    []api.Container{{Name: "abc", Image: "image", ImagePullPolicy: "IfNotPresent", TerminationMessagePolicy: api.TerminationMessageReadFile}},
+							},
+						},
 					},
 				},
 			},
-		}
+		},
+	}
+	errorCases["spec.jobTemplate.spec.ttlSecondsAfterFinished:must be greater than or equal to 0"] = batch.CronJob{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "mycronjob",
+			Namespace: metav1.NamespaceDefault,
+			UID:       types.UID("1a2b3c"),
+		},
+		Spec: batch.CronJobSpec{
+			Schedule:          "* * * * ?",
+			ConcurrencyPolicy: batch.AllowConcurrent,
+			JobTemplate: batch.JobTemplateSpec{
+				Spec: batch.JobSpec{
+					TTLSecondsAfterFinished: &negative,
+					Template:                validPodTemplateSpec,
+				},
+			},
+		},
 	}
 
 	for k, v := range errorCases {
-		errs := ValidateCronJob(&v)
+		errs := ValidateCronJob(&v, corevalidation.PodValidationOptions{})
 		if len(errs) == 0 {
 			t.Errorf("expected failure for %s", k)
 		} else {
@@ -644,7 +918,7 @@ func TestValidateCronJob(t *testing.T) {
 		// copy to avoid polluting the testcase object, set a resourceVersion to allow validating update, and test a no-op update
 		v = *v.DeepCopy()
 		v.ResourceVersion = "1"
-		errs = ValidateCronJobUpdate(&v, &v)
+		errs = ValidateCronJobUpdate(&v, &v, corevalidation.PodValidationOptions{})
 		if len(errs) == 0 {
 			if k == "metadata.name: must be no more than 52 characters" {
 				continue
@@ -660,8 +934,6 @@ func TestValidateCronJob(t *testing.T) {
 	}
 }
 
-func newBool(val bool) *bool {
-	p := new(bool)
-	*p = val
-	return p
+func completionModePtr(m batch.CompletionMode) *batch.CompletionMode {
+	return &m
 }

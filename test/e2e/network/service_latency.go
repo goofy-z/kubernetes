@@ -33,6 +33,7 @@ import (
 	"k8s.io/client-go/util/flowcontrol"
 	"k8s.io/kubernetes/test/e2e/framework"
 	e2erc "k8s.io/kubernetes/test/e2e/framework/rc"
+	"k8s.io/kubernetes/test/e2e/network/common"
 	testutils "k8s.io/kubernetes/test/utils"
 	imageutils "k8s.io/kubernetes/test/utils/image"
 
@@ -45,11 +46,11 @@ func (d durations) Len() int           { return len(d) }
 func (d durations) Less(i, j int) bool { return d[i] < d[j] }
 func (d durations) Swap(i, j int)      { d[i], d[j] = d[j], d[i] }
 
-var _ = SIGDescribe("Service endpoints latency", func() {
+var _ = common.SIGDescribe("Service endpoints latency", func() {
 	f := framework.NewDefaultFramework("svc-latency")
 
 	/*
-		Release : v1.9
+		Release: v1.9
 		Testname: Service endpoint latency, thresholds
 		Description: Run 100 iterations of create service with the Pod running the pause image, measure the time it takes for creating the service and the endpoint with the service name is available. These durations are captured for 100 iterations, then the durations are sorted to compute 50th, 90th and 99th percentile. The single server latency MUST not exceed liberally set thresholds of 20s for 50th percentile and 50s for the 90th percentile.
 	*/

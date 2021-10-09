@@ -23,7 +23,6 @@ import (
 	"time"
 
 	networkingv1 "k8s.io/api/networking/v1"
-	networkingv1beta1 "k8s.io/api/networking/v1beta1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	types "k8s.io/apimachinery/pkg/types"
@@ -32,18 +31,19 @@ import (
 	"k8s.io/apimachinery/pkg/watch"
 	clientset "k8s.io/client-go/kubernetes"
 	"k8s.io/kubernetes/test/e2e/framework"
+	"k8s.io/kubernetes/test/e2e/network/common"
 
 	"github.com/onsi/ginkgo"
 )
 
-var _ = SIGDescribe("IngressClass [Feature:Ingress]", func() {
+var _ = common.SIGDescribe("IngressClass [Feature:Ingress]", func() {
 	f := framework.NewDefaultFramework("ingressclass")
 	var cs clientset.Interface
 	ginkgo.BeforeEach(func() {
 		cs = f.ClientSet
 	})
 
-	ginkgo.It("should set default value on new IngressClass", func() {
+	ginkgo.It("should set default value on new IngressClass [Serial]", func() {
 		ingressClass1, err := createIngressClass(cs, "ingressclass1", true, f.UniqueName)
 		framework.ExpectNoError(err)
 		defer deleteIngressClass(cs, ingressClass1.Name)
@@ -58,7 +58,7 @@ var _ = SIGDescribe("IngressClass [Feature:Ingress]", func() {
 		}
 	})
 
-	ginkgo.It("should not set default value if no default IngressClass", func() {
+	ginkgo.It("should not set default value if no default IngressClass [Serial]", func() {
 		ingressClass1, err := createIngressClass(cs, "ingressclass1", false, f.UniqueName)
 		framework.ExpectNoError(err)
 		defer deleteIngressClass(cs, ingressClass1.Name)
@@ -71,7 +71,7 @@ var _ = SIGDescribe("IngressClass [Feature:Ingress]", func() {
 		}
 	})
 
-	ginkgo.It("should prevent Ingress creation if more than 1 IngressClass marked as default", func() {
+	ginkgo.It("should prevent Ingress creation if more than 1 IngressClass marked as default [Serial]", func() {
 		ingressClass1, err := createIngressClass(cs, "ingressclass1", true, f.UniqueName)
 		framework.ExpectNoError(err)
 		defer deleteIngressClass(cs, ingressClass1.Name)
@@ -113,7 +113,7 @@ func createIngressClass(cs clientset.Interface, name string, isDefault bool, uni
 	}
 
 	if isDefault {
-		ingressClass.Annotations = map[string]string{networkingv1beta1.AnnotationIsDefaultIngressClass: "true"}
+		ingressClass.Annotations = map[string]string{networkingv1.AnnotationIsDefaultIngressClass: "true"}
 	}
 
 	return cs.NetworkingV1().IngressClasses().Create(context.TODO(), ingressClass, metav1.CreateOptions{})
@@ -142,7 +142,7 @@ func deleteIngressClass(cs clientset.Interface, name string) {
 	framework.ExpectNoError(err)
 }
 
-var _ = SIGDescribe("IngressClass API", func() {
+var _ = common.SIGDescribe("IngressClass API", func() {
 	f := framework.NewDefaultFramework("ingressclass")
 	var cs clientset.Interface
 	ginkgo.BeforeEach(func() {
@@ -212,11 +212,11 @@ var _ = SIGDescribe("IngressClass API", func() {
 
 		// IngressClass resource create/read/update/watch verbs
 		ginkgo.By("creating")
-		ingressClass1, err := createIngressClass(cs, "ingressclass1", true, f.UniqueName)
+		ingressClass1, err := createIngressClass(cs, "ingressclass1", false, f.UniqueName)
 		framework.ExpectNoError(err)
-		_, err = createIngressClass(cs, "ingressclass2", true, f.UniqueName)
+		_, err = createIngressClass(cs, "ingressclass2", false, f.UniqueName)
 		framework.ExpectNoError(err)
-		_, err = createIngressClass(cs, "ingressclass3", true, f.UniqueName)
+		_, err = createIngressClass(cs, "ingressclass3", false, f.UniqueName)
 		framework.ExpectNoError(err)
 
 		ginkgo.By("getting")

@@ -51,6 +51,9 @@ type Interface interface {
 	FlushChain(table Table, chain Chain) error
 	// DeleteChain deletes the specified chain.  If the chain did not exist, return error.
 	DeleteChain(table Table, chain Chain) error
+	// ChainExists tests whether the specified chain exists, returning an error if it
+	// does not, or if it is unable to check.
+	ChainExists(table Table, chain Chain) (bool, error)
 	// EnsureRule checks if the specified rule is present and, if not, creates it.  If the rule existed, return true.
 	EnsureRule(position RulePosition, table Table, chain Chain, args ...string) (bool, error)
 	// DeleteRule checks if the specified rule is present and, if so, deletes it.
@@ -86,6 +89,9 @@ type Interface interface {
 	// mapped to the same IP:PORT and consequently some suffer packet
 	// drops.
 	HasRandomFully() bool
+
+	// Present checks if the kernel supports the iptable interface
+	Present() bool
 }
 
 // Protocol defines the ip protocol either ipv4 or ipv6
@@ -186,8 +192,11 @@ const WaitIntervalString = "-W"
 // WaitIntervalUsecondsValue a constant for specifying the default wait interval useconds
 const WaitIntervalUsecondsValue = "100000"
 
-// LockfilePath16x is the iptables lock file acquired by any process that's making any change in the iptable rule
+// LockfilePath16x is the iptables 1.6.x lock file acquired by any process that's making any change in the iptable rule
 const LockfilePath16x = "/run/xtables.lock"
+
+// LockfilePath14x is the iptables 1.4.x lock file acquired by any process that's making any change in the iptable rule
+const LockfilePath14x = "@xtables"
 
 // runner implements Interface in terms of exec("iptables").
 type runner struct {
@@ -198,20 +207,24 @@ type runner struct {
 	hasRandomFully  bool
 	waitFlag        []string
 	restoreWaitFlag []string
-	lockfilePath    string
+	lockfilePath14x string
+	lockfilePath16x string
 }
 
 // newInternal returns a new Interface which will exec iptables, and allows the
 // caller to change the iptables-restore lockfile path
-func newInternal(exec utilexec.Interface, protocol Protocol, lockfilePath string) Interface {
+func newInternal(exec utilexec.Interface, protocol Protocol, lockfilePath14x, lockfilePath16x string) Interface {
 	version, err := getIPTablesVersion(exec, protocol)
 	if err != nil {
 		klog.Warningf("Error checking iptables version, assuming version at least %s: %v", MinCheckVersion, err)
 		version = MinCheckVersion
 	}
 
-	if lockfilePath == "" {
-		lockfilePath = LockfilePath16x
+	if lockfilePath16x == "" {
+		lockfilePath16x = LockfilePath16x
+	}
+	if lockfilePath14x == "" {
+		lockfilePath14x = LockfilePath14x
 	}
 
 	runner := &runner{
@@ -221,14 +234,15 @@ func newInternal(exec utilexec.Interface, protocol Protocol, lockfilePath string
 		hasRandomFully:  version.AtLeast(RandomFullyMinVersion),
 		waitFlag:        getIPTablesWaitFlag(version),
 		restoreWaitFlag: getIPTablesRestoreWaitFlag(version, exec, protocol),
-		lockfilePath:    lockfilePath,
+		lockfilePath14x: lockfilePath14x,
+		lockfilePath16x: lockfilePath16x,
 	}
 	return runner
 }
 
 // New returns a new Interface which will exec iptables.
 func New(exec utilexec.Interface, protocol Protocol) Interface {
-	return newInternal(exec, protocol, "")
+	return newInternal(exec, protocol, "", "")
 }
 
 // EnsureChain is part of Interface.
@@ -390,7 +404,7 @@ func (runner *runner) restoreInternal(args []string, data []byte, flush FlushFla
 	// from stepping on each other.  iptables-restore 1.6.2 will have
 	// a --wait option like iptables itself, but that's not widely deployed.
 	if len(runner.restoreWaitFlag) == 0 {
-		locker, err := grabIptablesLocks(runner.lockfilePath)
+		locker, err := grabIptablesLocks(runner.lockfilePath14x, runner.lockfilePath16x)
 		if err != nil {
 			return err
 		}
@@ -562,7 +576,7 @@ func (runner *runner) Monitor(canary Chain, tables []Table, reloadFunc func(), i
 
 		// Poll until stopCh is closed or iptables is flushed
 		err := utilwait.PollUntil(interval, func() (bool, error) {
-			if exists, err := runner.chainExists(tables[0], canary); exists {
+			if exists, err := runner.ChainExists(tables[0], canary); exists {
 				return false, nil
 			} else if isResourceError(err) {
 				klog.Warningf("Could not check for iptables canary %s/%s: %v", string(tables[0]), string(canary), err)
@@ -574,7 +588,7 @@ func (runner *runner) Monitor(canary Chain, tables []Table, reloadFunc func(), i
 			// so we don't start reloading too soon.
 			err := utilwait.PollImmediate(iptablesFlushPollTime, iptablesFlushTimeout, func() (bool, error) {
 				for i := 1; i < len(tables); i++ {
-					if exists, err := runner.chainExists(tables[i], canary); exists || isResourceError(err) {
+					if exists, err := runner.ChainExists(tables[i], canary); exists || isResourceError(err) {
 						return false, nil
 					}
 				}
@@ -599,13 +613,15 @@ func (runner *runner) Monitor(canary Chain, tables []Table, reloadFunc func(), i
 	}
 }
 
-// chainExists is used internally by Monitor; none of the public Interface methods can be
-// used to distinguish "chain exists" from "chain does not exist" with no side effects
-func (runner *runner) chainExists(table Table, chain Chain) (bool, error) {
+// ChainExists is part of Interface
+func (runner *runner) ChainExists(table Table, chain Chain) (bool, error) {
 	fullArgs := makeFullArgs(table, chain)
 
 	runner.mu.Lock()
 	defer runner.mu.Unlock()
+
+	trace := utiltrace.New("iptables ChainExists")
+	defer trace.LogIfLong(2 * time.Second)
 
 	_, err := runner.run(opListChain, fullArgs)
 	return err == nil, err
@@ -617,8 +633,7 @@ const (
 	opCreateChain operation = "-N"
 	opFlushChain  operation = "-F"
 	opDeleteChain operation = "-X"
-	opListChain   operation = "-L"
-	opAppendRule  operation = "-A"
+	opListChain   operation = "-S"
 	opCheckRule   operation = "-C"
 	opDeleteRule  operation = "-D"
 )
@@ -709,6 +724,16 @@ func getIPTablesRestoreVersionString(exec utilexec.Interface, protocol Protocol)
 
 func (runner *runner) HasRandomFully() bool {
 	return runner.hasRandomFully
+}
+
+// Present tests if iptable is supported on current kernel by checking the existence
+// of default table and chain
+func (runner *runner) Present() bool {
+	if _, err := runner.ChainExists(TableNAT, ChainPostrouting); err != nil {
+		return false
+	}
+
+	return true
 }
 
 var iptablesNotFoundStrings = []string{

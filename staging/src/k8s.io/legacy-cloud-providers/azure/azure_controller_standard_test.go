@@ -1,3 +1,4 @@
+//go:build !providerless
 // +build !providerless
 
 /*
@@ -79,7 +80,7 @@ func TestStandardAttachDisk(t *testing.T) {
 
 	for i, test := range testCases {
 		testCloud := GetTestCloud(ctrl)
-		vmSet := testCloud.vmSet
+		vmSet := testCloud.VMSet
 		expectedVMs := setTestVirtualMachines(testCloud, map[string]string{"vm1": "PowerState/Running"}, false)
 		mockVMsClient := testCloud.VirtualMachinesClient.(*mockvmclient.MockInterface)
 		for _, vm := range expectedVMs {
@@ -148,7 +149,7 @@ func TestStandardDetachDisk(t *testing.T) {
 
 	for i, test := range testCases {
 		testCloud := GetTestCloud(ctrl)
-		vmSet := testCloud.vmSet
+		vmSet := testCloud.VMSet
 		expectedVMs := setTestVirtualMachines(testCloud, map[string]string{"vm1": "PowerState/Running"}, false)
 		mockVMsClient := testCloud.VirtualMachinesClient.(*mockvmclient.MockInterface)
 		for _, vm := range expectedVMs {
@@ -224,7 +225,7 @@ func TestGetDataDisks(t *testing.T) {
 	}
 	for i, test := range testCases {
 		testCloud := GetTestCloud(ctrl)
-		vmSet := testCloud.vmSet
+		vmSet := testCloud.VMSet
 		expectedVMs := setTestVirtualMachines(testCloud, map[string]string{"vm1": "PowerState/Running"}, false)
 		mockVMsClient := testCloud.VirtualMachinesClient.(*mockvmclient.MockInterface)
 		for _, vm := range expectedVMs {

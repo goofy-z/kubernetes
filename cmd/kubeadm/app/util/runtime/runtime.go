@@ -24,8 +24,9 @@ import (
 	"github.com/pkg/errors"
 
 	errorsutil "k8s.io/apimachinery/pkg/util/errors"
-	"k8s.io/kubernetes/cmd/kubeadm/app/constants"
 	utilsexec "k8s.io/utils/exec"
+
+	"k8s.io/kubernetes/cmd/kubeadm/app/constants"
 )
 
 // ContainerRuntime is an interface for working with container runtimes
@@ -140,10 +141,15 @@ func (runtime *CRIRuntime) RemoveContainers(containers []string) error {
 func (runtime *DockerRuntime) RemoveContainers(containers []string) error {
 	errs := []error{}
 	for _, container := range containers {
-		out, err := runtime.exec.Command("docker", "rm", "--force", "--volumes", container).CombinedOutput()
+		out, err := runtime.exec.Command("docker", "stop", container).CombinedOutput()
 		if err != nil {
 			// don't stop on errors, try to remove as many containers as possible
-			errs = append(errs, errors.Wrapf(err, "failed to remove running container %s: output: %s, error", container, string(out)))
+			errs = append(errs, errors.Wrapf(err, "failed to stop running container %s: output: %s, error", container, string(out)))
+		} else {
+			out, err = runtime.exec.Command("docker", "rm", "--volumes", container).CombinedOutput()
+			if err != nil {
+				errs = append(errs, errors.Wrapf(err, "failed to remove running container %s: output: %s, error", container, string(out)))
+			}
 		}
 	}
 	return errorsutil.NewAggregate(errs)

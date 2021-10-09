@@ -1,3 +1,4 @@
+//go:build !windows
 // +build !windows
 
 /*
@@ -83,7 +84,7 @@ func (sysd SystemdInitSystem) EnableCommand(service string) string {
 	return fmt.Sprintf("systemctl enable %s.service", service)
 }
 
-// reloadSystemd reloeads the systemd daemon
+// reloadSystemd reloads the systemd daemon
 func (sysd SystemdInitSystem) reloadSystemd() error {
 	if err := exec.Command("systemctl", "daemon-reload").Run(); err != nil {
 		return fmt.Errorf("failed to reload systemd: %v", err)

@@ -1,3 +1,4 @@
+//go:build !providerless
 // +build !providerless
 
 /*
@@ -25,10 +26,12 @@ import (
 	"sync"
 
 	"github.com/vmware/govmomi/object"
+	"github.com/vmware/govmomi/vim25/mo"
+	"k8s.io/klog/v2"
+
 	v1 "k8s.io/api/core/v1"
 	k8stypes "k8s.io/apimachinery/pkg/types"
 	cloudprovider "k8s.io/cloud-provider"
-	"k8s.io/klog/v2"
 	"k8s.io/legacy-cloud-providers/vsphere/vclib"
 )
 
@@ -201,10 +204,24 @@ func (nm *NodeManager) DiscoverNode(node *v1.Node) error {
 				if vm != nil {
 					klog.V(4).Infof("Found node %s as vm=%+v in vc=%s and datacenter=%s",
 						node.Name, vm, res.vc, res.datacenter.Name())
-
+					var vmObj mo.VirtualMachine
+					err := vm.Properties(ctx, vm.Reference(), []string{"config"}, &vmObj)
+					if err != nil || vmObj.Config == nil {
+						klog.Errorf("failed to retrieve guest vmconfig for node: %s Err: %v", node.Name, err)
+					} else {
+						klog.V(4).Infof("vm hardware version for node:%s is %s", node.Name, vmObj.Config.Version)
+						// vmconfig.Version returns vm hardware version as vmx-11, vmx-13, vmx-14, vmx-15 etc.
+						vmhardwaredeprecated, err := isGuestHardwareVersionDeprecated(vmObj.Config.Version)
+						if err != nil {
+							klog.Errorf("failed to check if vm hardware version is deprecated. VM Hardware Version: %s Err: %v", vmObj.Config.Version, err)
+						}
+						if vmhardwaredeprecated {
+							klog.Warningf("VM Hardware version: %s from node: %s is deprecated. Please consider upgrading virtual machine hardware version to vmx-15 or higher", vmObj.Config.Version, node.Name)
+						}
+					}
 					// Get the node zone information
-					nodeFd := node.ObjectMeta.Labels[v1.LabelZoneFailureDomain]
-					nodeRegion := node.ObjectMeta.Labels[v1.LabelZoneRegion]
+					nodeFd := node.ObjectMeta.Labels[v1.LabelTopologyZone]
+					nodeRegion := node.ObjectMeta.Labels[v1.LabelTopologyRegion]
 					nodeZone := &cloudprovider.Zone{FailureDomain: nodeFd, Region: nodeRegion}
 					nodeInfo := &NodeInfo{dataCenter: res.datacenter, vm: vm, vcServer: res.vc, vmUUID: nodeUUID, zone: nodeZone}
 					nm.addNodeInfo(node.ObjectMeta.Name, nodeInfo)
@@ -259,6 +276,16 @@ func (nm *NodeManager) GetNode(nodeName k8stypes.NodeName) (v1.Node, error) {
 	return *node, nil
 }
 
+func (nm *NodeManager) getNodes() map[string]*v1.Node {
+	nm.registeredNodesLock.RLock()
+	defer nm.registeredNodesLock.RUnlock()
+	registeredNodes := make(map[string]*v1.Node, len(nm.registeredNodes))
+	for nodeName, node := range nm.registeredNodes {
+		registeredNodes[nodeName] = node
+	}
+	return registeredNodes
+}
+
 func (nm *NodeManager) addNode(node *v1.Node) {
 	nm.registeredNodesLock.Lock()
 	nm.registeredNodes[node.ObjectMeta.Name] = node
@@ -288,11 +315,9 @@ func (nm *NodeManager) GetNodeInfo(nodeName k8stypes.NodeName) (NodeInfo, error)
 //
 // This method is a getter but it can cause side-effect of updating NodeInfo objects.
 func (nm *NodeManager) GetNodeDetails() ([]NodeDetails, error) {
-	nm.registeredNodesLock.Lock()
-	defer nm.registeredNodesLock.Unlock()
 	var nodeDetails []NodeDetails
 
-	for nodeName, nodeObj := range nm.registeredNodes {
+	for nodeName, nodeObj := range nm.getNodes() {
 		nodeInfo, err := nm.GetNodeInfoWithNodeObject(nodeObj)
 		if err != nil {
 			return nil, err
@@ -303,11 +328,19 @@ func (nm *NodeManager) GetNodeDetails() ([]NodeDetails, error) {
 	return nodeDetails, nil
 }
 
-func (nm *NodeManager) refreshNodes() (errList []error) {
-	nm.registeredNodesLock.Lock()
-	defer nm.registeredNodesLock.Unlock()
+// GetNodeNames returns list of nodes that are known to vsphere cloudprovider.
+// These are typically nodes that make up k8s cluster.
+func (nm *NodeManager) GetNodeNames() []k8stypes.NodeName {
+	nodes := nm.getNodes()
+	var nodeNameList []k8stypes.NodeName
+	for _, node := range nodes {
+		nodeNameList = append(nodeNameList, k8stypes.NodeName(node.Name))
+	}
+	return nodeNameList
+}
 
-	for nodeName := range nm.registeredNodes {
+func (nm *NodeManager) refreshNodes() (errList []error) {
+	for nodeName := range nm.getNodes() {
 		nodeInfo, err := nm.getRefreshedNodeInfo(convertToK8sType(nodeName))
 		if err != nil {
 			errList = append(errList, err)

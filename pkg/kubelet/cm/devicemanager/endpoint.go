@@ -35,6 +35,7 @@ import (
 type endpoint interface {
 	run()
 	stop()
+	getPreferredAllocation(available, mustInclude []string, size int) (*pluginapi.PreferredAllocationResponse, error)
 	allocate(devs []string) (*pluginapi.AllocateResponse, error)
 	preStartContainer(devs []string) (*pluginapi.PreStartContainerResponse, error)
 	callback(resourceName string, devices []pluginapi.Device)
@@ -59,7 +60,7 @@ type endpointImpl struct {
 func newEndpointImpl(socketPath, resourceName string, callback monitorCallback) (*endpointImpl, error) {
 	client, c, err := dial(socketPath)
 	if err != nil {
-		klog.Errorf("Can't create new endpoint with path %s err %v", socketPath, err)
+		klog.ErrorS(err, "Can't create new endpoint with socket path", "path", socketPath)
 		return nil, err
 	}
 
@@ -95,7 +96,7 @@ func (e *endpointImpl) callback(resourceName string, devices []pluginapi.Device)
 func (e *endpointImpl) run() {
 	stream, err := e.client.ListAndWatch(context.Background(), &pluginapi.Empty{})
 	if err != nil {
-		klog.Errorf(errListAndWatch, e.resourceName, err)
+		klog.ErrorS(err, "listAndWatch ended unexpectedly for device plugin", "resourceName", e.resourceName)
 
 		return
 	}
@@ -103,12 +104,12 @@ func (e *endpointImpl) run() {
 	for {
 		response, err := stream.Recv()
 		if err != nil {
-			klog.Errorf(errListAndWatch, e.resourceName, err)
+			klog.ErrorS(err, "listAndWatch ended unexpectedly for device plugin", "resourceName", e.resourceName)
 			return
 		}
 
 		devs := response.Devices
-		klog.V(2).Infof("State pushed for device plugin %s", e.resourceName)
+		klog.V(2).InfoS("State pushed for device plugin", "resourceName", e.resourceName, "resourceCapacity", len(devs))
 
 		var newDevs []pluginapi.Device
 		for _, d := range devs {
@@ -136,6 +137,22 @@ func (e *endpointImpl) setStopTime(t time.Time) {
 	e.mutex.Lock()
 	defer e.mutex.Unlock()
 	e.stopTime = t
+}
+
+// getPreferredAllocation issues GetPreferredAllocation gRPC call to the device plugin.
+func (e *endpointImpl) getPreferredAllocation(available, mustInclude []string, size int) (*pluginapi.PreferredAllocationResponse, error) {
+	if e.isStopped() {
+		return nil, fmt.Errorf(errEndpointStopped, e)
+	}
+	return e.client.GetPreferredAllocation(context.Background(), &pluginapi.PreferredAllocationRequest{
+		ContainerRequests: []*pluginapi.ContainerPreferredAllocationRequest{
+			{
+				AvailableDeviceIDs:   available,
+				MustIncludeDeviceIDs: mustInclude,
+				AllocationSize:       int32(size),
+			},
+		},
+	})
 }
 
 // allocate issues Allocate gRPC call to the device plugin.

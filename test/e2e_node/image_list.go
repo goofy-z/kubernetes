@@ -17,14 +17,17 @@ limitations under the License.
 package e2enode
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"os/exec"
 	"os/user"
+	"sync"
 	"time"
 
 	"k8s.io/klog/v2"
 
+	utilerrors "k8s.io/apimachinery/pkg/util/errors"
 	"k8s.io/apimachinery/pkg/util/sets"
 	internalapi "k8s.io/cri-api/pkg/apis"
 	runtimeapi "k8s.io/cri-api/pkg/apis/runtime/v1alpha2"
@@ -41,6 +44,8 @@ const (
 	maxImagePullRetries = 5
 	// Sleep duration between image pull retry attempts.
 	imagePullRetryDelay = time.Second
+	// Number of parallel count to pull images.
+	maxParallelImagePullCount = 5
 )
 
 // NodePrePullImageList is a list of images used in node e2e test. These images will be prepulled
@@ -55,26 +60,39 @@ var NodePrePullImageList = sets.NewString(
 	imageutils.GetE2EImage(imageutils.Perl),
 	imageutils.GetE2EImage(imageutils.Nonewprivs),
 	imageutils.GetPauseImageName(),
-	getGPUDevicePluginImage(),
-	"gcr.io/kubernetes-e2e-test-images/node-perf/npb-is:1.0",
-	"gcr.io/kubernetes-e2e-test-images/node-perf/npb-ep:1.0",
-	"gcr.io/kubernetes-e2e-test-images/node-perf/tf-wide-deep-amd64:1.0",
+	imageutils.GetE2EImage(imageutils.NodePerfNpbEp),
+	imageutils.GetE2EImage(imageutils.NodePerfNpbIs),
+	imageutils.GetE2EImage(imageutils.NodePerfTfWideDeep),
 )
 
-// updateImageWhiteList updates the framework.ImageWhiteList with
+// updateImageAllowList updates the framework.ImagePrePullList with
 // 1. the hard coded lists
 // 2. the ones passed in from framework.TestContext.ExtraEnvs
 // So this function needs to be called after the extra envs are applied.
-func updateImageWhiteList() {
-	// Union NodePrePullImageList and CommonImageWhiteList into the framework image pre-pull list.
-	framework.ImageWhiteList = NodePrePullImageList.Union(commontest.PrePulledImages)
+func updateImageAllowList() {
+	// Union NodePrePullImageList and PrePulledImages into the framework image pre-pull list.
+	framework.ImagePrePullList = NodePrePullImageList.Union(commontest.PrePulledImages)
 	// Images from extra envs
-	framework.ImageWhiteList.Insert(getNodeProblemDetectorImage())
-	framework.ImageWhiteList.Insert(getSRIOVDevicePluginImage())
+	framework.ImagePrePullList.Insert(getNodeProblemDetectorImage())
+	if sriovDevicePluginImage, err := getSRIOVDevicePluginImage(); err != nil {
+		klog.Errorln(err)
+	} else {
+		framework.ImagePrePullList.Insert(sriovDevicePluginImage)
+	}
+	if gpuDevicePluginImage, err := getGPUDevicePluginImage(); err != nil {
+		klog.Errorln(err)
+	} else {
+		framework.ImagePrePullList.Insert(gpuDevicePluginImage)
+	}
+	if kubeVirtPluginImage, err := getKubeVirtDevicePluginImage(); err != nil {
+		klog.Errorln(err)
+	} else {
+		framework.ImagePrePullList.Insert(kubeVirtPluginImage)
+	}
 }
 
 func getNodeProblemDetectorImage() string {
-	const defaultImage string = "k8s.gcr.io/node-problem-detector:v0.6.2"
+	const defaultImage string = "k8s.gcr.io/node-problem-detector/node-problem-detector:v0.8.7"
 	image := os.Getenv("NODE_PROBLEM_DETECTOR_IMAGE")
 	if image == "" {
 		image = defaultImage
@@ -149,68 +167,115 @@ func PrePullAllImages() error {
 	if err != nil {
 		return err
 	}
-	images := framework.ImageWhiteList.List()
+	images := framework.ImagePrePullList.List()
 	klog.V(4).Infof("Pre-pulling images with %s %+v", puller.Name(), images)
-	for _, image := range images {
-		var (
-			err    error
-			output []byte
-		)
-		for i := 0; i < maxImagePullRetries; i++ {
-			if i > 0 {
-				time.Sleep(imagePullRetryDelay)
-			}
-			if output, err = puller.Pull(image); err == nil {
-				break
-			}
-			klog.Warningf("Failed to pull %s as user %q, retrying in %s (%d of %d): %v",
-				image, usr.Username, imagePullRetryDelay.String(), i+1, maxImagePullRetries, err)
-		}
-		if err != nil {
-			klog.Warningf("Could not pre-pull image %s %v output: %s", image, err, output)
-			return err
-		}
+
+	imageCh := make(chan int, len(images))
+	for i := range images {
+		imageCh <- i
 	}
-	return nil
+	close(imageCh)
+
+	pullErrs := make([]error, len(images))
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	parallelImagePullCount := maxParallelImagePullCount
+	if len(images) < parallelImagePullCount {
+		parallelImagePullCount = len(images)
+	}
+
+	var wg sync.WaitGroup
+	wg.Add(parallelImagePullCount)
+	for i := 0; i < parallelImagePullCount; i++ {
+		go func() {
+			defer wg.Done()
+
+			for i := range imageCh {
+				var (
+					pullErr error
+					output  []byte
+				)
+				for retryCount := 0; retryCount < maxImagePullRetries; retryCount++ {
+					select {
+					case <-ctx.Done():
+						return
+					default:
+					}
+
+					if retryCount > 0 {
+						time.Sleep(imagePullRetryDelay)
+					}
+					if output, pullErr = puller.Pull(images[i]); pullErr == nil {
+						break
+					}
+					klog.Warningf("Failed to pull %s as user %q, retrying in %s (%d of %d): %v",
+						images[i], usr.Username, imagePullRetryDelay.String(), retryCount+1, maxImagePullRetries, pullErr)
+				}
+				if pullErr != nil {
+					klog.Warningf("Could not pre-pull image %s %v output: %s", images[i], pullErr, output)
+					pullErrs[i] = pullErr
+					cancel()
+					return
+				}
+			}
+		}()
+	}
+
+	wg.Wait()
+	return utilerrors.NewAggregate(pullErrs)
 }
 
 // getGPUDevicePluginImage returns the image of GPU device plugin.
-func getGPUDevicePluginImage() string {
+func getGPUDevicePluginImage() (string, error) {
 	ds, err := e2emanifest.DaemonSetFromURL(e2egpu.GPUDevicePluginDSYAML)
 	if err != nil {
-		klog.Errorf("Failed to parse the device plugin image: %v", err)
-		return ""
+		return "", fmt.Errorf("failed to parse the device plugin image: %w", err)
 	}
 	if ds == nil {
-		klog.Errorf("Failed to parse the device plugin image: the extracted DaemonSet is nil")
-		return ""
+		return "", fmt.Errorf("failed to parse the device plugin image: the extracted DaemonSet is nil")
 	}
 	if len(ds.Spec.Template.Spec.Containers) < 1 {
-		klog.Errorf("Failed to parse the device plugin image: cannot extract the container from YAML")
-		return ""
+		return "", fmt.Errorf("failed to parse the device plugin image: cannot extract the container from YAML")
 	}
-	return ds.Spec.Template.Spec.Containers[0].Image
+	return ds.Spec.Template.Spec.Containers[0].Image, nil
 }
 
 // getSRIOVDevicePluginImage returns the image of SRIOV device plugin.
-func getSRIOVDevicePluginImage() string {
+func getSRIOVDevicePluginImage() (string, error) {
 	data, err := e2etestfiles.Read(SRIOVDevicePluginDSYAML)
 	if err != nil {
-		klog.Errorf("Failed to read the device plugin manifest: %v", err)
-		return ""
+		return "", fmt.Errorf("failed to read the device plugin manifest: %w", err)
 	}
 	ds, err := e2emanifest.DaemonSetFromData(data)
 	if err != nil {
-		klog.Errorf("Failed to parse the device plugin image: %v", err)
-		return ""
+		return "", fmt.Errorf("failed to parse the device plugin image: %w", err)
 	}
 	if ds == nil {
-		klog.Errorf("Failed to parse the device plugin image: the extracted DaemonSet is nil")
-		return ""
+		return "", fmt.Errorf("failed to parse the device plugin image: the extracted DaemonSet is nil")
 	}
 	if len(ds.Spec.Template.Spec.Containers) < 1 {
-		klog.Errorf("Failed to parse the device plugin image: cannot extract the container from YAML")
-		return ""
+		return "", fmt.Errorf("failed to parse the device plugin image: cannot extract the container from YAML")
 	}
-	return ds.Spec.Template.Spec.Containers[0].Image
+	return ds.Spec.Template.Spec.Containers[0].Image, nil
+}
+
+//TODO generilize this function with above one
+// getKubeVirtDevicePluginImage returns the image of SRIOV device plugin.
+func getKubeVirtDevicePluginImage() (string, error) {
+	data, err := e2etestfiles.Read(KubeVirtDevicePluginDSYAML)
+	if err != nil {
+		return "", fmt.Errorf("failed to read the device plugin manifest: %w", err)
+	}
+	ds, err := e2emanifest.DaemonSetFromData(data)
+	if err != nil {
+		return "", fmt.Errorf("failed to parse the device plugin image: %w", err)
+	}
+	if ds == nil {
+		return "", fmt.Errorf("failed to parse the device plugin image: the extracted DaemonSet is nil")
+	}
+	if len(ds.Spec.Template.Spec.Containers) < 1 {
+		return "", fmt.Errorf("failed to parse the device plugin image: cannot extract the container from YAML")
+	}
+	return ds.Spec.Template.Spec.Containers[0].Image, nil
 }

@@ -25,7 +25,8 @@ import (
 	"sync"
 
 	v1 "k8s.io/api/core/v1"
-	discovery "k8s.io/api/discovery/v1beta1"
+	discovery "k8s.io/api/discovery/v1"
+	apiequality "k8s.io/apimachinery/pkg/api/equality"
 	"k8s.io/apimachinery/pkg/labels"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
 	"k8s.io/apimachinery/pkg/util/sets"
@@ -106,9 +107,6 @@ func (sc *ServiceSelectorCache) GetPodServiceMemberships(serviceLister v1listers
 	return set, nil
 }
 
-// EndpointsMatch is a type of function that returns true if pod endpoints match.
-type EndpointsMatch func(*v1.Pod, *v1.Pod) bool
-
 // PortMapKey is used to uniquely identify groups of endpoint ports.
 type PortMapKey string
 
@@ -125,14 +123,14 @@ func DeepHashObjectToString(objectToWrite interface{}) string {
 	return hex.EncodeToString(hasher.Sum(nil)[0:])
 }
 
-// ShouldPodBeInEndpoints returns true if a specified pod should be in an
-// endpoints object. Terminating pods are only included if publishNotReady is true.
-func ShouldPodBeInEndpoints(pod *v1.Pod, publishNotReady bool) bool {
+// ShouldPodBeInEndpointSlice returns true if a specified pod should be in an EndpointSlice object.
+// Terminating pods are only included if includeTerminating is true
+func ShouldPodBeInEndpointSlice(pod *v1.Pod, includeTerminating bool) bool {
 	if len(pod.Status.PodIP) == 0 && len(pod.Status.PodIPs) == 0 {
 		return false
 	}
 
-	if !publishNotReady && pod.DeletionTimestamp != nil {
+	if !includeTerminating && pod.DeletionTimestamp != nil {
 		return false
 	}
 
@@ -153,9 +151,10 @@ func ShouldSetHostname(pod *v1.Pod, svc *v1.Service) bool {
 	return len(pod.Spec.Hostname) > 0 && pod.Spec.Subdomain == svc.Name && svc.Namespace == pod.Namespace
 }
 
-// PodChanged returns two boolean values, the first returns true if the pod.
-// has changed, the second value returns true if the pod labels have changed.
-func PodChanged(oldPod, newPod *v1.Pod, endpointChanged EndpointsMatch) (bool, bool) {
+// podEndpointsChanged returns two boolean values. The first is true if the pod has
+// changed in a way that may change existing endpoints. The second value is true if the
+// pod has changed in a way that may affect which Services it matches.
+func podEndpointsChanged(oldPod, newPod *v1.Pod) (bool, bool) {
 	// Check if the pod labels have changed, indicating a possible
 	// change in the service membership
 	labelsChanged := false
@@ -175,16 +174,27 @@ func PodChanged(oldPod, newPod *v1.Pod, endpointChanged EndpointsMatch) (bool, b
 	if podutil.IsPodReady(oldPod) != podutil.IsPodReady(newPod) {
 		return true, labelsChanged
 	}
-	// Convert the pod to an Endpoint, clear inert fields,
-	// and see if they are the same.
-	// TODO: Add a watcher for node changes separate from this
-	// We don't want to trigger multiple syncs at a pod level when a node changes
-	return endpointChanged(newPod, oldPod), labelsChanged
+
+	// Check if the pod IPs have changed
+	if len(oldPod.Status.PodIPs) != len(newPod.Status.PodIPs) {
+		return true, labelsChanged
+	}
+	for i := range oldPod.Status.PodIPs {
+		if oldPod.Status.PodIPs[i].IP != newPod.Status.PodIPs[i].IP {
+			return true, labelsChanged
+		}
+	}
+
+	// Endpoints may also reference a pod's Name, Namespace, UID, and NodeName, but
+	// the first three are immutable, and NodeName is immutable once initially set,
+	// which happens before the pod gets an IP.
+
+	return false, labelsChanged
 }
 
 // GetServicesToUpdateOnPodChange returns a set of Service keys for Services
 // that have potentially been affected by a change to this pod.
-func GetServicesToUpdateOnPodChange(serviceLister v1listers.ServiceLister, selectorCache *ServiceSelectorCache, old, cur interface{}, endpointChanged EndpointsMatch) sets.String {
+func GetServicesToUpdateOnPodChange(serviceLister v1listers.ServiceLister, selectorCache *ServiceSelectorCache, old, cur interface{}) sets.String {
 	newPod := cur.(*v1.Pod)
 	oldPod := old.(*v1.Pod)
 	if newPod.ResourceVersion == oldPod.ResourceVersion {
@@ -193,7 +203,7 @@ func GetServicesToUpdateOnPodChange(serviceLister v1listers.ServiceLister, selec
 		return sets.String{}
 	}
 
-	podChanged, labelsChanged := PodChanged(oldPod, newPod, endpointChanged)
+	podChanged, labelsChanged := podEndpointsChanged(oldPod, newPod)
 
 	// If both the pod and labels are unchanged, no update is needed
 	if !podChanged && !labelsChanged {
@@ -265,4 +275,61 @@ func (sl portsInOrder) Less(i, j int) bool {
 	h1 := DeepHashObjectToString(sl[i])
 	h2 := DeepHashObjectToString(sl[j])
 	return h1 < h2
+}
+
+// endpointsEqualBeyondHash returns true if endpoints have equal attributes
+// but excludes equality checks that would have already been covered with
+// endpoint hashing (see hashEndpoint func for more info).
+func EndpointsEqualBeyondHash(ep1, ep2 *discovery.Endpoint) bool {
+	if stringPtrChanged(ep1.NodeName, ep1.NodeName) {
+		return false
+	}
+
+	if stringPtrChanged(ep1.Zone, ep1.Zone) {
+		return false
+	}
+
+	if boolPtrChanged(ep1.Conditions.Ready, ep2.Conditions.Ready) {
+		return false
+	}
+
+	if objectRefPtrChanged(ep1.TargetRef, ep2.TargetRef) {
+		return false
+	}
+
+	return true
+}
+
+// boolPtrChanged returns true if a set of bool pointers have different values.
+func boolPtrChanged(ptr1, ptr2 *bool) bool {
+	if (ptr1 == nil) != (ptr2 == nil) {
+		return true
+	}
+	if ptr1 != nil && ptr2 != nil && *ptr1 != *ptr2 {
+		return true
+	}
+	return false
+}
+
+// objectRefPtrChanged returns true if a set of object ref pointers have
+// different values.
+func objectRefPtrChanged(ref1, ref2 *v1.ObjectReference) bool {
+	if (ref1 == nil) != (ref2 == nil) {
+		return true
+	}
+	if ref1 != nil && ref2 != nil && !apiequality.Semantic.DeepEqual(*ref1, *ref2) {
+		return true
+	}
+	return false
+}
+
+// stringPtrChanged returns true if a set of string pointers have different values.
+func stringPtrChanged(ptr1, ptr2 *string) bool {
+	if (ptr1 == nil) != (ptr2 == nil) {
+		return true
+	}
+	if ptr1 != nil && ptr2 != nil && *ptr1 != *ptr2 {
+		return true
+	}
+	return false
 }

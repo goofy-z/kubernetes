@@ -1,3 +1,4 @@
+//go:build !providerless
 // +build !providerless
 
 /*
@@ -23,7 +24,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"net"
 	"path"
 	"regexp"
 	"sort"
@@ -35,7 +35,6 @@ import (
 	"github.com/aws/aws-sdk-go/aws"
 	"github.com/aws/aws-sdk-go/aws/awserr"
 	"github.com/aws/aws-sdk-go/aws/credentials"
-	"github.com/aws/aws-sdk-go/aws/credentials/ec2rolecreds"
 	"github.com/aws/aws-sdk-go/aws/credentials/stscreds"
 	"github.com/aws/aws-sdk-go/aws/ec2metadata"
 	"github.com/aws/aws-sdk-go/aws/endpoints"
@@ -50,6 +49,7 @@ import (
 	"gopkg.in/gcfg.v1"
 	v1 "k8s.io/api/core/v1"
 	"k8s.io/klog/v2"
+	netutils "k8s.io/utils/net"
 
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -187,9 +187,25 @@ const ServiceAnnotationLoadBalancerBEProtocol = "service.beta.kubernetes.io/aws-
 // For example: "Key1=Val1,Key2=Val2,KeyNoVal1=,KeyNoVal2"
 const ServiceAnnotationLoadBalancerAdditionalTags = "service.beta.kubernetes.io/aws-load-balancer-additional-resource-tags"
 
+// ServiceAnnotationLoadBalancerHealthCheckProtocol is the annotation used on the service to
+// specify the protocol used for the ELB health check. Supported values are TCP, HTTP, HTTPS
+// Default is TCP if externalTrafficPolicy is Cluster, HTTP if externalTrafficPolicy is Local
+const ServiceAnnotationLoadBalancerHealthCheckProtocol = "service.beta.kubernetes.io/aws-load-balancer-healthcheck-protocol"
+
+// ServiceAnnotationLoadBalancerHealthCheckPort is the annotation used on the service to
+// specify the port used for ELB health check.
+// Default is traffic-port if externalTrafficPolicy is Cluster, healthCheckNodePort if externalTrafficPolicy is Local
+const ServiceAnnotationLoadBalancerHealthCheckPort = "service.beta.kubernetes.io/aws-load-balancer-healthcheck-port"
+
+// ServiceAnnotationLoadBalancerHealthCheckPath is the annotation used on the service to
+// specify the path for the ELB health check when the health check protocol is HTTP/HTTPS
+// Defaults to /healthz if externalTrafficPolicy is Local, / otherwise
+const ServiceAnnotationLoadBalancerHealthCheckPath = "service.beta.kubernetes.io/aws-load-balancer-healthcheck-path"
+
 // ServiceAnnotationLoadBalancerHCHealthyThreshold is the annotation used on
 // the service to specify the number of successive successful health checks
-// required for a backend to be considered healthy for traffic.
+// required for a backend to be considered healthy for traffic. For NLB, healthy-threshold
+// and unhealthy-threshold must be equal.
 const ServiceAnnotationLoadBalancerHCHealthyThreshold = "service.beta.kubernetes.io/aws-load-balancer-healthcheck-healthy-threshold"
 
 // ServiceAnnotationLoadBalancerHCUnhealthyThreshold is the annotation used
@@ -216,6 +232,16 @@ const ServiceAnnotationLoadBalancerEIPAllocations = "service.beta.kubernetes.io/
 // the target nodes for the load balancer
 // For example: "Key1=Val1,Key2=Val2,KeyNoVal1=,KeyNoVal2"
 const ServiceAnnotationLoadBalancerTargetNodeLabels = "service.beta.kubernetes.io/aws-load-balancer-target-node-labels"
+
+// ServiceAnnotationLoadBalancerSubnets is the annotation used on the service to specify the
+// Availability Zone configuration for the load balancer. The values are comma separated list of
+// subnetID or subnetName from different AZs
+// By default, the controller will auto-discover the subnets. If there are multiple subnets per AZ, auto-discovery
+// will break the tie in the following order -
+//   1. prefer the subnet with the correct role tag. kubernetes.io/role/elb for public and kubernetes.io/role/internal-elb for private access
+//   2. prefer the subnet with the cluster tag kubernetes.io/cluster/<Cluster Name>
+//   3. prefer the subnet that is first in lexicographic order
+const ServiceAnnotationLoadBalancerSubnets = "service.beta.kubernetes.io/aws-load-balancer-subnets"
 
 // Event key when a volume is stuck on attaching state when being attached to a volume
 const volumeAttachmentStuck = "VolumeAttachmentStuck"
@@ -255,6 +281,14 @@ const (
 	// Number of node names that can be added to a filter. The AWS limit is 200
 	// but we are using a lower limit on purpose
 	filterNodeLimit = 150
+)
+
+const (
+	// represents expected attachment status of a volume after attach
+	volumeAttachedStatus = "attached"
+
+	// represents expected attachment status of a volume after detach
+	volumeDetachedStatus = "detached"
 )
 
 // awsTagNameMasterRoles is a set of well-known AWS tag names that indicate the instance is a master
@@ -427,7 +461,7 @@ const (
 // Source: http://docs.aws.amazon.com/AWSEC2/latest/UserGuide/EBSVolumeTypes.html
 const (
 	MinTotalIOPS = 100
-	MaxTotalIOPS = 20000
+	MaxTotalIOPS = 64000
 )
 
 // VolumeOptions specifies capacity and tags for a volume.
@@ -787,8 +821,11 @@ func (p *awsSDKProvider) Compute(regionName string) (EC2, error) {
 	}
 	awsConfig = awsConfig.WithCredentialsChainVerboseErrors(true).
 		WithEndpointResolver(p.cfg.getResolver())
+	sess, err := session.NewSessionWithOptions(session.Options{
+		Config:            *awsConfig,
+		SharedConfigState: session.SharedConfigEnable,
+	})
 
-	sess, err := session.NewSession(awsConfig)
 	if err != nil {
 		return nil, fmt.Errorf("unable to initialize AWS session: %v", err)
 	}
@@ -809,8 +846,10 @@ func (p *awsSDKProvider) LoadBalancing(regionName string) (ELB, error) {
 	}
 	awsConfig = awsConfig.WithCredentialsChainVerboseErrors(true).
 		WithEndpointResolver(p.cfg.getResolver())
-
-	sess, err := session.NewSession(awsConfig)
+	sess, err := session.NewSessionWithOptions(session.Options{
+		Config:            *awsConfig,
+		SharedConfigState: session.SharedConfigEnable,
+	})
 	if err != nil {
 		return nil, fmt.Errorf("unable to initialize AWS session: %v", err)
 	}
@@ -827,8 +866,10 @@ func (p *awsSDKProvider) LoadBalancingV2(regionName string) (ELBV2, error) {
 	}
 	awsConfig = awsConfig.WithCredentialsChainVerboseErrors(true).
 		WithEndpointResolver(p.cfg.getResolver())
-
-	sess, err := session.NewSession(awsConfig)
+	sess, err := session.NewSessionWithOptions(session.Options{
+		Config:            *awsConfig,
+		SharedConfigState: session.SharedConfigEnable,
+	})
 	if err != nil {
 		return nil, fmt.Errorf("unable to initialize AWS session: %v", err)
 	}
@@ -846,8 +887,10 @@ func (p *awsSDKProvider) Autoscaling(regionName string) (ASG, error) {
 	}
 	awsConfig = awsConfig.WithCredentialsChainVerboseErrors(true).
 		WithEndpointResolver(p.cfg.getResolver())
-
-	sess, err := session.NewSession(awsConfig)
+	sess, err := session.NewSessionWithOptions(session.Options{
+		Config:            *awsConfig,
+		SharedConfigState: session.SharedConfigEnable,
+	})
 	if err != nil {
 		return nil, fmt.Errorf("unable to initialize AWS session: %v", err)
 	}
@@ -877,8 +920,10 @@ func (p *awsSDKProvider) KeyManagement(regionName string) (KMS, error) {
 	}
 	awsConfig = awsConfig.WithCredentialsChainVerboseErrors(true).
 		WithEndpointResolver(p.cfg.getResolver())
-
-	sess, err := session.NewSession(awsConfig)
+	sess, err := session.NewSessionWithOptions(session.Options{
+		Config:            *awsConfig,
+		SharedConfigState: session.SharedConfigEnable,
+	})
 	if err != nil {
 		return nil, fmt.Errorf("unable to initialize AWS session: %v", err)
 	}
@@ -1136,30 +1181,28 @@ func init() {
 			return nil, fmt.Errorf("unable to validate custom endpoint overrides: %v", err)
 		}
 
-		sess, err := session.NewSession(&aws.Config{})
+		sess, err := session.NewSessionWithOptions(session.Options{
+			Config:            aws.Config{},
+			SharedConfigState: session.SharedConfigEnable,
+		})
 		if err != nil {
 			return nil, fmt.Errorf("unable to initialize AWS session: %v", err)
 		}
 
-		var provider credentials.Provider
-		if cfg.Global.RoleARN == "" {
-			provider = &ec2rolecreds.EC2RoleProvider{
-				Client: ec2metadata.New(sess),
-			}
-		} else {
+		var creds *credentials.Credentials
+		if cfg.Global.RoleARN != "" {
 			klog.Infof("Using AWS assumed role %v", cfg.Global.RoleARN)
-			provider = &stscreds.AssumeRoleProvider{
+			provider := &stscreds.AssumeRoleProvider{
 				Client:  sts.New(sess),
 				RoleARN: cfg.Global.RoleARN,
 			}
-		}
 
-		creds := credentials.NewChainCredentials(
-			[]credentials.Provider{
-				&credentials.EnvProvider{},
-				provider,
-				&credentials.SharedCredentialsProvider{},
-			})
+			creds = credentials.NewChainCredentials(
+				[]credentials.Provider{
+					&credentials.EnvProvider{},
+					provider,
+				})
+		}
 
 		aws := newAWSSDKProvider(creds, cfg)
 		return newAWSCloud(*cfg, aws)
@@ -1395,6 +1438,7 @@ func (c *Cloud) Instances() (cloudprovider.Instances, bool) {
 }
 
 // InstancesV2 returns an implementation of InstancesV2 for Amazon Web Services.
+// TODO: implement ONLY for external cloud provider
 func (c *Cloud) InstancesV2() (cloudprovider.InstancesV2, bool) {
 	return nil, false
 }
@@ -1548,7 +1592,7 @@ func extractNodeAddresses(instance *ec2.Instance) ([]v1.NodeAddress, error) {
 
 		for _, internalIP := range networkInterface.PrivateIpAddresses {
 			if ipAddress := aws.StringValue(internalIP.PrivateIpAddress); ipAddress != "" {
-				ip := net.ParseIP(ipAddress)
+				ip := netutils.ParseIPSloppy(ipAddress)
 				if ip == nil {
 					return nil, fmt.Errorf("EC2 instance had invalid private address: %s (%q)", aws.StringValue(instance.InstanceId), ipAddress)
 				}
@@ -1560,7 +1604,7 @@ func extractNodeAddresses(instance *ec2.Instance) ([]v1.NodeAddress, error) {
 	// TODO: Other IP addresses (multiple ips)?
 	publicIPAddress := aws.StringValue(instance.PublicIpAddress)
 	if publicIPAddress != "" {
-		ip := net.ParseIP(publicIPAddress)
+		ip := netutils.ParseIPSloppy(publicIPAddress)
 		if ip == nil {
 			return nil, fmt.Errorf("EC2 instance had invalid public address: %s (%s)", aws.StringValue(instance.InstanceId), publicIPAddress)
 		}
@@ -1668,31 +1712,6 @@ func (c *Cloud) InstanceShutdownByProviderID(ctx context.Context, providerID str
 		}
 	}
 	return false, nil
-}
-
-// InstanceMetadataByProviderID returns metadata of the specified instance.
-func (c *Cloud) InstanceMetadataByProviderID(ctx context.Context, providerID string) (*cloudprovider.InstanceMetadata, error) {
-	instanceID, err := KubernetesInstanceID(providerID).MapToAWSInstanceID()
-	if err != nil {
-		return nil, err
-	}
-
-	instance, err := describeInstance(c.ec2, instanceID)
-	if err != nil {
-		return nil, err
-	}
-
-	// TODO ignore checking whether `*instance.State.Name == ec2.InstanceStateNameTerminated` here.
-	// If not behave as expected, add it.
-	addresses, err := extractNodeAddresses(instance)
-	if err != nil {
-		return nil, err
-	}
-	return &cloudprovider.InstanceMetadata{
-		ProviderID:    providerID,
-		Type:          aws.StringValue(instance.InstanceType),
-		NodeAddresses: addresses,
-	}, nil
 }
 
 // InstanceID returns the cloud provider ID of the node with the specified nodeName.
@@ -1967,7 +1986,6 @@ func (c *Cloud) getMountDevice(
 				// AWS API returns consistent result next time (i.e. the volume is detached).
 				status := volumeStatus[mappingVolumeID]
 				klog.Warningf("Got assignment call for already-assigned volume: %s@%s, volume status: %s", mountDevice, mappingVolumeID, status)
-				return mountDevice, false, fmt.Errorf("volume is still being detached from the node")
 			}
 			return mountDevice, true, nil
 		}
@@ -2168,7 +2186,7 @@ func (c *Cloud) applyUnSchedulableTaint(nodeName types.NodeName, reason string) 
 
 // waitForAttachmentStatus polls until the attachment status is the expected value
 // On success, it returns the last attachment state.
-func (d *awsDisk) waitForAttachmentStatus(status string, expectedInstance, expectedDevice string) (*ec2.VolumeAttachment, error) {
+func (d *awsDisk) waitForAttachmentStatus(status string, expectedInstance, expectedDevice string, alreadyAttached bool) (*ec2.VolumeAttachment, error) {
 	backoff := wait.Backoff{
 		Duration: volumeAttachmentStatusPollDelay,
 		Factor:   volumeAttachmentStatusFactor,
@@ -2193,7 +2211,7 @@ func (d *awsDisk) waitForAttachmentStatus(status string, expectedInstance, expec
 		if err != nil {
 			// The VolumeNotFound error is special -- we don't need to wait for it to repeat
 			if isAWSErrorVolumeNotFound(err) {
-				if status == "detached" {
+				if status == volumeDetachedStatus {
 					// The disk doesn't exist, assume it's detached, log warning and stop waiting
 					klog.Warningf("Waiting for volume %q to be detached but the volume does not exist", d.awsID)
 					stateStr := "detached"
@@ -2202,7 +2220,7 @@ func (d *awsDisk) waitForAttachmentStatus(status string, expectedInstance, expec
 					}
 					return true, nil
 				}
-				if status == "attached" {
+				if status == volumeAttachedStatus {
 					// The disk doesn't exist, complain, give up waiting and report error
 					klog.Warningf("Waiting for volume %q to be attached but the volume does not exist", d.awsID)
 					return false, err
@@ -2237,7 +2255,7 @@ func (d *awsDisk) waitForAttachmentStatus(status string, expectedInstance, expec
 			}
 		}
 		if attachmentStatus == "" {
-			attachmentStatus = "detached"
+			attachmentStatus = volumeDetachedStatus
 		}
 		if attachment != nil {
 			// AWS eventual consistency can go back in time.
@@ -2264,6 +2282,13 @@ func (d *awsDisk) waitForAttachmentStatus(status string, expectedInstance, expec
 				}
 				return false, nil
 			}
+		}
+
+		// if we expected volume to be attached and it was reported as already attached via DescribeInstance call
+		// but DescribeVolume told us volume is detached, we will short-circuit this long wait loop and return error
+		// so as AttachDisk can be retried without waiting for 20 minutes.
+		if (status == volumeAttachedStatus) && alreadyAttached && (attachmentStatus != status) {
+			return false, fmt.Errorf("attachment of disk %q failed, expected device to be attached but was %s", d.name, attachmentStatus)
 		}
 
 		if attachmentStatus == status {
@@ -2411,7 +2436,7 @@ func (c *Cloud) AttachDisk(diskName KubernetesVolumeID, nodeName types.NodeName)
 		klog.V(2).Infof("AttachVolume volume=%q instance=%q request returned %v", disk.awsID, awsInstance.awsID, attachResponse)
 	}
 
-	attachment, err := disk.waitForAttachmentStatus("attached", awsInstance.awsID, ec2Device)
+	attachment, err := disk.waitForAttachmentStatus("attached", awsInstance.awsID, ec2Device, alreadyAttached)
 
 	if err != nil {
 		if err == wait.ErrWaitTimeout {
@@ -2489,7 +2514,7 @@ func (c *Cloud) DetachDisk(diskName KubernetesVolumeID, nodeName types.NodeName)
 		return "", errors.New("no response from DetachVolume")
 	}
 
-	attachment, err := diskInfo.disk.waitForAttachmentStatus("detached", awsInstance.awsID, "")
+	attachment, err := diskInfo.disk.waitForAttachmentStatus("detached", awsInstance.awsID, "", false)
 	if err != nil {
 		return "", err
 	}
@@ -2539,7 +2564,7 @@ func (c *Cloud) CreateDisk(volumeOptions *VolumeOptions) (KubernetesVolumeID, er
 		createType = DefaultVolumeType
 
 	default:
-		return "", fmt.Errorf("invalid AWS VolumeType %q", volumeOptions.VolumeType)
+		return KubernetesVolumeID(""), fmt.Errorf("invalid AWS VolumeType %q", volumeOptions.VolumeType)
 	}
 
 	request := &ec2.CreateVolumeInput{}
@@ -2571,12 +2596,12 @@ func (c *Cloud) CreateDisk(volumeOptions *VolumeOptions) (KubernetesVolumeID, er
 
 	response, err := c.ec2.CreateVolume(request)
 	if err != nil {
-		return "", err
+		return KubernetesVolumeID(""), err
 	}
 
 	awsID := EBSVolumeID(aws.StringValue(response.VolumeId))
 	if awsID == "" {
-		return "", fmt.Errorf("VolumeID was not returned by CreateVolume")
+		return KubernetesVolumeID(""), fmt.Errorf("VolumeID was not returned by CreateVolume")
 	}
 	volumeName := KubernetesVolumeID("aws://" + aws.StringValue(response.AvailabilityZone) + "/" + string(awsID))
 
@@ -2589,8 +2614,22 @@ func (c *Cloud) CreateDisk(volumeOptions *VolumeOptions) (KubernetesVolumeID, er
 		// because Kubernetes may have limited permissions to the key.
 		if isAWSErrorVolumeNotFound(err) {
 			err = fmt.Errorf("failed to create encrypted volume: the volume disappeared after creation, most likely due to inaccessible KMS encryption key")
+		} else {
+			// When DescribeVolumes api failed, plugin will lose track on the volumes' state
+			// driver should be able to clean up these kind of volumes to make sure they are not leaked on customers' account
+			klog.V(5).Infof("Failed to create the volume %v due to %v. Will try to delete it.", volumeName, err)
+			awsDisk, newDiskError := newAWSDisk(c, volumeName)
+			if newDiskError != nil {
+				klog.Errorf("Failed to delete the volume %v due to error: %v", volumeName, newDiskError)
+			} else {
+				if _, deleteVolumeError := awsDisk.deleteVolume(); deleteVolumeError != nil {
+					klog.Errorf("Failed to delete the volume %v due to error: %v", volumeName, deleteVolumeError)
+				} else {
+					klog.V(5).Infof("%v is deleted because it is not in desired state after waiting", volumeName)
+				}
+			}
 		}
-		return "", err
+		return KubernetesVolumeID(""), err
 	}
 
 	return volumeName, nil
@@ -2733,12 +2772,12 @@ func (c *Cloud) GetVolumeLabels(volumeName KubernetesVolumeID) (map[string]strin
 		return nil, fmt.Errorf("volume did not have AZ information: %q", aws.StringValue(info.VolumeId))
 	}
 
-	labels[v1.LabelZoneFailureDomain] = az
+	labels[v1.LabelTopologyZone] = az
 	region, err := azToRegion(az)
 	if err != nil {
 		return nil, err
 	}
-	labels[v1.LabelZoneRegion] = region
+	labels[v1.LabelTopologyRegion] = region
 
 	return labels, nil
 }
@@ -3362,7 +3401,7 @@ func findTag(tags []*ec2.Tag, key string) (string, bool) {
 	return "", false
 }
 
-// Finds the subnets associated with the cluster, by matching tags.
+// Finds the subnets associated with the cluster, by matching cluster tags if present.
 // For maximal backwards compatibility, if no subnets are tagged, it will fall-back to the current subnet.
 // However, in future this will likely be treated as an error.
 func (c *Cloud) findSubnets() ([]*ec2.Subnet, error) {
@@ -3377,6 +3416,8 @@ func (c *Cloud) findSubnets() ([]*ec2.Subnet, error) {
 	var matches []*ec2.Subnet
 	for _, subnet := range subnets {
 		if c.tagging.hasClusterTag(subnet.Tags) {
+			matches = append(matches, subnet)
+		} else if c.tagging.hasNoClusterPrefixTag(subnet.Tags) {
 			matches = append(matches, subnet)
 		}
 	}
@@ -3441,7 +3482,7 @@ func (c *Cloud) findELBSubnets(internalELB bool) ([]string, error) {
 			continue
 		}
 
-		// Try to break the tie using a tag
+		// Try to break the tie using the role tag
 		var tagName string
 		if internalELB {
 			tagName = TagNameSubnetInternalELB
@@ -3459,8 +3500,17 @@ func (c *Cloud) findELBSubnets(internalELB bool) ([]string, error) {
 			continue
 		}
 
+		// Prefer the one with the cluster Tag
+		existingHasClusterTag := c.tagging.hasClusterTag(existing.Tags)
+		subnetHasClusterTag := c.tagging.hasClusterTag(subnet.Tags)
+		if existingHasClusterTag != subnetHasClusterTag {
+			if subnetHasClusterTag {
+				subnetsByAZ[az] = subnet
+			}
+			continue
+		}
+
 		// If we have two subnets for the same AZ we arbitrarily choose the one that is first lexicographically.
-		// TODO: Should this be an error.
 		if strings.Compare(*existing.SubnetId, *subnet.SubnetId) > 0 {
 			klog.Warningf("Found multiple subnets in AZ %q; choosing %q between subnets %q and %q", az, *subnet.SubnetId, *existing.SubnetId, *subnet.SubnetId)
 			subnetsByAZ[az] = subnet
@@ -3484,6 +3534,90 @@ func (c *Cloud) findELBSubnets(internalELB bool) ([]string, error) {
 	}
 
 	return subnetIDs, nil
+}
+
+func splitCommaSeparatedString(commaSeparatedString string) []string {
+	var result []string
+	parts := strings.Split(commaSeparatedString, ",")
+	for _, part := range parts {
+		part = strings.TrimSpace(part)
+		if len(part) == 0 {
+			continue
+		}
+		result = append(result, part)
+	}
+	return result
+}
+
+// parses comma separated values from annotation into string slice, returns true if annotation exists
+func parseStringSliceAnnotation(annotations map[string]string, annotation string, value *[]string) bool {
+	rawValue := ""
+	if exists := parseStringAnnotation(annotations, annotation, &rawValue); !exists {
+		return false
+	}
+	*value = splitCommaSeparatedString(rawValue)
+	return true
+}
+
+func (c *Cloud) getLoadBalancerSubnets(service *v1.Service, internalELB bool) ([]string, error) {
+	var rawSubnetNameOrIDs []string
+	if exists := parseStringSliceAnnotation(service.Annotations, ServiceAnnotationLoadBalancerSubnets, &rawSubnetNameOrIDs); exists {
+		return c.resolveSubnetNameOrIDs(rawSubnetNameOrIDs)
+	}
+	return c.findELBSubnets(internalELB)
+}
+
+func (c *Cloud) resolveSubnetNameOrIDs(subnetNameOrIDs []string) ([]string, error) {
+	var subnetIDs []string
+	var subnetNames []string
+	if len(subnetNameOrIDs) == 0 {
+		return []string{}, fmt.Errorf("unable to resolve empty subnet slice")
+	}
+	for _, nameOrID := range subnetNameOrIDs {
+		if strings.HasPrefix(nameOrID, "subnet-") {
+			subnetIDs = append(subnetIDs, nameOrID)
+		} else {
+			subnetNames = append(subnetNames, nameOrID)
+		}
+	}
+	var resolvedSubnets []*ec2.Subnet
+	if len(subnetIDs) > 0 {
+		req := &ec2.DescribeSubnetsInput{
+			SubnetIds: aws.StringSlice(subnetIDs),
+		}
+		subnets, err := c.ec2.DescribeSubnets(req)
+		if err != nil {
+			return []string{}, err
+		}
+		resolvedSubnets = append(resolvedSubnets, subnets...)
+	}
+	if len(subnetNames) > 0 {
+		req := &ec2.DescribeSubnetsInput{
+			Filters: []*ec2.Filter{
+				{
+					Name:   aws.String("tag:Name"),
+					Values: aws.StringSlice(subnetNames),
+				},
+				{
+					Name:   aws.String("vpc-id"),
+					Values: aws.StringSlice([]string{c.vpcID}),
+				},
+			},
+		}
+		subnets, err := c.ec2.DescribeSubnets(req)
+		if err != nil {
+			return []string{}, err
+		}
+		resolvedSubnets = append(resolvedSubnets, subnets...)
+	}
+	if len(resolvedSubnets) != len(subnetNameOrIDs) {
+		return []string{}, fmt.Errorf("expected to find %v, but found %v subnets", len(subnetNameOrIDs), len(resolvedSubnets))
+	}
+	var subnets []string
+	for _, subnet := range resolvedSubnets {
+		subnets = append(subnets, aws.StringValue(subnet.SubnetId))
+	}
+	return subnets, nil
 }
 
 func isSubnetPublic(rt []*ec2.RouteTable, subnetID string) (bool, error) {
@@ -3675,9 +3809,110 @@ func buildListener(port v1.ServicePort, annotations map[string]string, sslPorts 
 	return listener, nil
 }
 
+func (c *Cloud) getSubnetCidrs(subnetIDs []string) ([]string, error) {
+	request := &ec2.DescribeSubnetsInput{}
+	for _, subnetID := range subnetIDs {
+		request.SubnetIds = append(request.SubnetIds, aws.String(subnetID))
+	}
+
+	subnets, err := c.ec2.DescribeSubnets(request)
+	if err != nil {
+		return nil, fmt.Errorf("error querying Subnet for ELB: %q", err)
+	}
+	if len(subnets) != len(subnetIDs) {
+		return nil, fmt.Errorf("error querying Subnet for ELB, got %d subnets for %v", len(subnets), subnetIDs)
+	}
+
+	cidrs := make([]string, 0, len(subnets))
+	for _, subnet := range subnets {
+		cidrs = append(cidrs, aws.StringValue(subnet.CidrBlock))
+	}
+	return cidrs, nil
+}
+
+func parseStringAnnotation(annotations map[string]string, annotation string, value *string) bool {
+	if v, ok := annotations[annotation]; ok {
+		*value = v
+		return true
+	}
+	return false
+}
+
+func parseInt64Annotation(annotations map[string]string, annotation string, value *int64) (bool, error) {
+	if v, ok := annotations[annotation]; ok {
+		parsed, err := strconv.ParseInt(v, 10, 0)
+		if err != nil {
+			return true, fmt.Errorf("failed to parse annotation %v=%v", annotation, v)
+		}
+		*value = parsed
+		return true, nil
+	}
+	return false, nil
+}
+
+func (c *Cloud) buildNLBHealthCheckConfiguration(svc *v1.Service) (healthCheckConfig, error) {
+	hc := healthCheckConfig{
+		Port:               defaultHealthCheckPort,
+		Path:               defaultHealthCheckPath,
+		Protocol:           elbv2.ProtocolEnumTcp,
+		Interval:           defaultNlbHealthCheckInterval,
+		Timeout:            defaultNlbHealthCheckTimeout,
+		HealthyThreshold:   defaultNlbHealthCheckThreshold,
+		UnhealthyThreshold: defaultNlbHealthCheckThreshold,
+	}
+	if svc.Spec.ExternalTrafficPolicy == v1.ServiceExternalTrafficPolicyTypeLocal {
+		path, port := servicehelpers.GetServiceHealthCheckPathPort(svc)
+		hc = healthCheckConfig{
+			Port:               strconv.Itoa(int(port)),
+			Path:               path,
+			Protocol:           elbv2.ProtocolEnumHttp,
+			Interval:           10,
+			Timeout:            10,
+			HealthyThreshold:   2,
+			UnhealthyThreshold: 2,
+		}
+	}
+	if parseStringAnnotation(svc.Annotations, ServiceAnnotationLoadBalancerHealthCheckProtocol, &hc.Protocol) {
+		hc.Protocol = strings.ToUpper(hc.Protocol)
+	}
+	switch hc.Protocol {
+	case elbv2.ProtocolEnumHttp, elbv2.ProtocolEnumHttps:
+		parseStringAnnotation(svc.Annotations, ServiceAnnotationLoadBalancerHealthCheckPath, &hc.Path)
+	case elbv2.ProtocolEnumTcp:
+		hc.Path = ""
+	default:
+		return healthCheckConfig{}, fmt.Errorf("Unsupported health check protocol %v", hc.Protocol)
+	}
+
+	parseStringAnnotation(svc.Annotations, ServiceAnnotationLoadBalancerHealthCheckPort, &hc.Port)
+
+	if _, err := parseInt64Annotation(svc.Annotations, ServiceAnnotationLoadBalancerHCInterval, &hc.Interval); err != nil {
+		return healthCheckConfig{}, err
+	}
+	if _, err := parseInt64Annotation(svc.Annotations, ServiceAnnotationLoadBalancerHCTimeout, &hc.Timeout); err != nil {
+		return healthCheckConfig{}, err
+	}
+	if _, err := parseInt64Annotation(svc.Annotations, ServiceAnnotationLoadBalancerHCHealthyThreshold, &hc.HealthyThreshold); err != nil {
+		return healthCheckConfig{}, err
+	}
+	if _, err := parseInt64Annotation(svc.Annotations, ServiceAnnotationLoadBalancerHCUnhealthyThreshold, &hc.UnhealthyThreshold); err != nil {
+		return healthCheckConfig{}, err
+	}
+
+	if hc.Port != defaultHealthCheckPort {
+		if _, err := strconv.ParseInt(hc.Port, 10, 0); err != nil {
+			return healthCheckConfig{}, fmt.Errorf("Invalid health check port '%v'", hc.Port)
+		}
+	}
+	return hc, nil
+}
+
 // EnsureLoadBalancer implements LoadBalancer.EnsureLoadBalancer
 func (c *Cloud) EnsureLoadBalancer(ctx context.Context, clusterName string, apiService *v1.Service, nodes []*v1.Node) (*v1.LoadBalancerStatus, error) {
 	annotations := apiService.Annotations
+	if isLBExternal(annotations) {
+		return nil, cloudprovider.ImplementedElsewhere
+	}
 	klog.V(2).Infof("EnsureLoadBalancer(%v, %v, %v, %v, %v, %v, %v)",
 		clusterName, apiService.Namespace, apiService.Name, c.region, apiService.Spec.LoadBalancerIP, apiService.Spec.Ports, annotations)
 
@@ -3689,7 +3924,6 @@ func (c *Cloud) EnsureLoadBalancer(ctx context.Context, clusterName string, apiS
 	if len(apiService.Spec.Ports) == 0 {
 		return nil, fmt.Errorf("requested load balancer with no ports")
 	}
-
 	// Figure out what mappings we want on the load balancer
 	listeners := []*elb.Listener{}
 	v2Mappings := []nlbPortMapping{}
@@ -3711,11 +3945,10 @@ func (c *Cloud) EnsureLoadBalancer(ctx context.Context, clusterName string, apiS
 				FrontendProtocol: string(port.Protocol),
 				TrafficPort:      int64(port.NodePort),
 				TrafficProtocol:  string(port.Protocol),
-
-				// if externalTrafficPolicy == "Local", we'll override the
-				// health check later
-				HealthCheckPort:     int64(port.NodePort),
-				HealthCheckProtocol: elbv2.ProtocolEnumTcp,
+			}
+			var err error
+			if portMapping.HealthCheckConfig, err = c.buildNLBHealthCheckConfiguration(apiService); err != nil {
+				return nil, err
 			}
 
 			certificateARN := annotations[ServiceAnnotationLoadBalancerCertificate]
@@ -3763,17 +3996,8 @@ func (c *Cloud) EnsureLoadBalancer(ctx context.Context, clusterName string, apiS
 	}
 
 	if isNLB(annotations) {
-
-		if path, healthCheckNodePort := servicehelpers.GetServiceHealthCheckPathPort(apiService); path != "" {
-			for i := range v2Mappings {
-				v2Mappings[i].HealthCheckPort = int64(healthCheckNodePort)
-				v2Mappings[i].HealthCheckPath = path
-				v2Mappings[i].HealthCheckProtocol = elbv2.ProtocolEnumHttp
-			}
-		}
-
 		// Find the subnets that the ELB will live in
-		subnetIDs, err := c.findELBSubnets(internalELB)
+		subnetIDs, err := c.getLoadBalancerSubnets(apiService, internalELB)
 		if err != nil {
 			klog.Errorf("Error listing subnets in VPC: %q", err)
 			return nil, err
@@ -3804,6 +4028,12 @@ func (c *Cloud) EnsureLoadBalancer(ctx context.Context, clusterName string, apiS
 			return nil, err
 		}
 
+		subnetCidrs, err := c.getSubnetCidrs(subnetIDs)
+		if err != nil {
+			klog.Errorf("Error getting subnet cidrs: %q", err)
+			return nil, err
+		}
+
 		sourceRangeCidrs := []string{}
 		for cidr := range sourceRanges {
 			sourceRangeCidrs = append(sourceRangeCidrs, cidr)
@@ -3812,7 +4042,7 @@ func (c *Cloud) EnsureLoadBalancer(ctx context.Context, clusterName string, apiS
 			sourceRangeCidrs = append(sourceRangeCidrs, "0.0.0.0/0")
 		}
 
-		err = c.updateInstanceSecurityGroupsForNLB(loadBalancerName, instances, sourceRangeCidrs, v2Mappings)
+		err = c.updateInstanceSecurityGroupsForNLB(loadBalancerName, instances, subnetCidrs, sourceRangeCidrs, v2Mappings)
 		if err != nil {
 			klog.Warningf("Error opening ingress rules for the load balancer to the instances: %q", err)
 			return nil, err
@@ -3934,7 +4164,7 @@ func (c *Cloud) EnsureLoadBalancer(ctx context.Context, clusterName string, apiS
 	}
 
 	// Find the subnets that the ELB will live in
-	subnetIDs, err := c.findELBSubnets(internalELB)
+	subnetIDs, err := c.getLoadBalancerSubnets(apiService, internalELB)
 	if err != nil {
 		klog.Errorf("Error listing subnets in VPC: %q", err)
 		return nil, err
@@ -4022,23 +4252,26 @@ func (c *Cloud) EnsureLoadBalancer(ctx context.Context, clusterName string, apiS
 		}
 	}
 
+	// We only configure a TCP health-check on the first port
+	var tcpHealthCheckPort int32
+	for _, listener := range listeners {
+		if listener.InstancePort == nil {
+			continue
+		}
+		tcpHealthCheckPort = int32(*listener.InstancePort)
+		break
+	}
 	if path, healthCheckNodePort := servicehelpers.GetServiceHealthCheckPathPort(apiService); path != "" {
 		klog.V(4).Infof("service %v (%v) needs health checks on :%d%s)", apiService.Name, loadBalancerName, healthCheckNodePort, path)
+		if annotations[ServiceAnnotationLoadBalancerHealthCheckPort] == defaultHealthCheckPort {
+			healthCheckNodePort = tcpHealthCheckPort
+		}
 		err = c.ensureLoadBalancerHealthCheck(loadBalancer, "HTTP", healthCheckNodePort, path, annotations)
 		if err != nil {
 			return nil, fmt.Errorf("Failed to ensure health check for localized service %v on node port %v: %q", loadBalancerName, healthCheckNodePort, err)
 		}
 	} else {
 		klog.V(4).Infof("service %v does not need custom health checks", apiService.Name)
-		// We only configure a TCP health-check on the first port
-		var tcpHealthCheckPort int32
-		for _, listener := range listeners {
-			if listener.InstancePort == nil {
-				continue
-			}
-			tcpHealthCheckPort = int32(*listener.InstancePort)
-			break
-		}
 		annotationProtocol := strings.ToLower(annotations[ServiceAnnotationLoadBalancerBEProtocol])
 		var hcProtocol string
 		if annotationProtocol == "https" || annotationProtocol == "ssl" {
@@ -4075,6 +4308,9 @@ func (c *Cloud) EnsureLoadBalancer(ctx context.Context, clusterName string, apiS
 
 // GetLoadBalancer is an implementation of LoadBalancer.GetLoadBalancer
 func (c *Cloud) GetLoadBalancer(ctx context.Context, clusterName string, service *v1.Service) (*v1.LoadBalancerStatus, bool, error) {
+	if isLBExternal(service.Annotations) {
+		return nil, false, nil
+	}
 	loadBalancerName := c.GetLoadBalancerName(ctx, clusterName, service)
 
 	if isNLB(service.Annotations) {
@@ -4335,6 +4571,9 @@ func (c *Cloud) updateInstanceSecurityGroupsForLoadBalancer(lb *elb.LoadBalancer
 
 // EnsureLoadBalancerDeleted implements LoadBalancer.EnsureLoadBalancerDeleted.
 func (c *Cloud) EnsureLoadBalancerDeleted(ctx context.Context, clusterName string, service *v1.Service) error {
+	if isLBExternal(service.Annotations) {
+		return nil
+	}
 	loadBalancerName := c.GetLoadBalancerName(ctx, clusterName, service)
 
 	if isNLB(service.Annotations) {
@@ -4383,7 +4622,7 @@ func (c *Cloud) EnsureLoadBalancerDeleted(ctx context.Context, clusterName strin
 			}
 		}
 
-		return c.updateInstanceSecurityGroupsForNLB(loadBalancerName, nil, nil, nil)
+		return c.updateInstanceSecurityGroupsForNLB(loadBalancerName, nil, nil, nil, nil)
 	}
 
 	lb, err := c.describeLoadBalancer(loadBalancerName)
@@ -4519,11 +4758,13 @@ func (c *Cloud) EnsureLoadBalancerDeleted(ctx context.Context, clusterName strin
 
 // UpdateLoadBalancer implements LoadBalancer.UpdateLoadBalancer
 func (c *Cloud) UpdateLoadBalancer(ctx context.Context, clusterName string, service *v1.Service, nodes []*v1.Node) error {
+	if isLBExternal(service.Annotations) {
+		return cloudprovider.ImplementedElsewhere
+	}
 	instances, err := c.findInstancesForELB(nodes, service.Annotations)
 	if err != nil {
 		return err
 	}
-
 	loadBalancerName := c.GetLoadBalancerName(ctx, clusterName, service)
 	if isNLB(service.Annotations) {
 		lb, err := c.describeLoadBalancerv2(loadBalancerName)
@@ -4797,7 +5038,7 @@ func setNodeDisk(
 }
 
 func getInitialAttachDetachDelay(status string) time.Duration {
-	if status == "detached" {
+	if status == volumeDetachedStatus {
 		return volumeDetachmentStatusInitialDelay
 	}
 	return volumeAttachmentStatusInitialDelay

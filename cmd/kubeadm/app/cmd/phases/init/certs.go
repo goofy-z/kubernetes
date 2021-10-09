@@ -18,13 +18,15 @@ package phases
 
 import (
 	"fmt"
+	"os"
+	"path/filepath"
 	"strings"
 
 	"github.com/pkg/errors"
-	"github.com/spf13/pflag"
+
 	kubeadmapi "k8s.io/kubernetes/cmd/kubeadm/app/apis/kubeadm"
 	kubeadmscheme "k8s.io/kubernetes/cmd/kubeadm/app/apis/kubeadm/scheme"
-	kubeadmapiv1beta2 "k8s.io/kubernetes/cmd/kubeadm/app/apis/kubeadm/v1beta2"
+	kubeadmapiv1 "k8s.io/kubernetes/cmd/kubeadm/app/apis/kubeadm/v1beta3"
 	"k8s.io/kubernetes/cmd/kubeadm/app/cmd/options"
 	"k8s.io/kubernetes/cmd/kubeadm/app/cmd/phases/workflow"
 	cmdutil "k8s.io/kubernetes/cmd/kubeadm/app/cmd/util"
@@ -41,15 +43,10 @@ var (
 		`+cmdutil.AlphaDisclaimer), kubeadmconstants.ServiceAccountPrivateKeyName, kubeadmconstants.ServiceAccountPublicKeyName)
 
 	genericLongDesc = cmdutil.LongDesc(`
-		Generate the %[1]s, and save them into %[2]s.cert and %[2]s.key files.%[3]s
+		Generate the %[1]s, and save them into %[2]s.crt and %[2]s.key files.%[3]s
 
 		If both files already exist, kubeadm skips the generation step and existing files will be used.
 		` + cmdutil.AlphaDisclaimer)
-)
-
-var (
-	csrOnly bool
-	csrDir  string
 )
 
 // NewCertsPhase returns the phase for the certs
@@ -61,13 +58,6 @@ func NewCertsPhase() workflow.Phase {
 		Run:    runCerts,
 		Long:   cmdutil.MacroCommandLongDescription,
 	}
-}
-
-func localFlags() *pflag.FlagSet {
-	set := pflag.NewFlagSet("csr", pflag.ExitOnError)
-	options.AddCSRFlag(set, &csrOnly)
-	options.AddCSRDirFlag(set, &csrDir)
-	return set
 }
 
 // newCertSubPhases returns sub phases for certs phase
@@ -94,7 +84,6 @@ func newCertSubPhases() []workflow.Phase {
 			lastCACert = cert
 		} else {
 			phase = newCertSubPhase(cert, runCertPhase(cert, lastCACert))
-			phase.LocalFlags = localFlags()
 		}
 		subPhases = append(subPhases, phase)
 	}
@@ -133,8 +122,6 @@ func getCertPhaseFlags(name string) []string {
 	flags := []string{
 		options.CertificatesDir,
 		options.CfgPath,
-		options.CSROnly,
-		options.CSRDir,
 		options.KubernetesVersion,
 	}
 	if name == "all" || name == "apiserver" {
@@ -151,12 +138,12 @@ func getCertPhaseFlags(name string) []string {
 
 func getSANDescription(certSpec *certsphase.KubeadmCert) string {
 	//Defaulted config we will use to get SAN certs
-	defaultConfig := &kubeadmapiv1beta2.InitConfiguration{
-		LocalAPIEndpoint: kubeadmapiv1beta2.APIEndpoint{
-			// GetAPIServerAltNames errors without an AdvertiseAddress; this is as good as any.
-			AdvertiseAddress: "127.0.0.1",
-		},
+	defaultConfig := cmdutil.DefaultInitConfiguration()
+	// GetAPIServerAltNames errors without an AdvertiseAddress; this is as good as any.
+	defaultConfig.LocalAPIEndpoint = kubeadmapiv1.APIEndpoint{
+		AdvertiseAddress: "127.0.0.1",
 	}
+
 	defaultInternalConfig := &kubeadmapi.InitConfiguration{}
 
 	kubeadmscheme.Scheme.Default(defaultConfig)
@@ -210,6 +197,20 @@ func runCerts(c workflow.RunData) error {
 	}
 
 	fmt.Printf("[certs] Using certificateDir folder %q\n", data.CertificateWriteDir())
+
+	// If using an external CA while dryrun, copy CA cert to dryrun dir for later use
+	if data.ExternalCA() && data.DryRun() {
+		externalCAFile := filepath.Join(data.Cfg().CertificatesDir, kubeadmconstants.CACertName)
+		fileInfo, _ := os.Stat(externalCAFile)
+		contents, err := os.ReadFile(externalCAFile)
+		if err != nil {
+			return err
+		}
+		err = os.WriteFile(filepath.Join(data.CertificateWriteDir(), kubeadmconstants.CACertName), contents, fileInfo.Mode())
+		if err != nil {
+			return err
+		}
+	}
 	return nil
 }
 
@@ -226,7 +227,9 @@ func runCAPhase(ca *certsphase.KubeadmCert) func(c workflow.RunData) error {
 			return nil
 		}
 
-		if _, err := pkiutil.TryLoadCertFromDisk(data.CertificateDir(), ca.BaseName); err == nil {
+		if cert, err := pkiutil.TryLoadCertFromDisk(data.CertificateDir(), ca.BaseName); err == nil {
+			certsphase.CheckCertificatePeriodValidity(ca.BaseName, cert)
+
 			if _, err := pkiutil.TryLoadKeyFromDisk(data.CertificateDir(), ca.BaseName); err == nil {
 				fmt.Printf("[certs] Using existing %s certificate authority\n", ca.BaseName)
 				return nil
@@ -258,27 +261,22 @@ func runCertPhase(cert *certsphase.KubeadmCert, caCert *certsphase.KubeadmCert) 
 			return nil
 		}
 
-		if certData, _, err := pkiutil.TryLoadCertAndKeyFromDisk(data.CertificateDir(), cert.BaseName); err == nil {
+		if certData, intermediates, err := pkiutil.TryLoadCertChainFromDisk(data.CertificateDir(), cert.BaseName); err == nil {
+			certsphase.CheckCertificatePeriodValidity(cert.BaseName, certData)
+
 			caCertData, err := pkiutil.TryLoadCertFromDisk(data.CertificateDir(), caCert.BaseName)
 			if err != nil {
 				return errors.Wrapf(err, "couldn't load CA certificate %s", caCert.Name)
 			}
 
-			if err := certData.CheckSignatureFrom(caCertData); err != nil {
+			certsphase.CheckCertificatePeriodValidity(caCert.BaseName, caCertData)
+
+			if err := pkiutil.VerifyCertChain(certData, intermediates, caCertData); err != nil {
 				return errors.Wrapf(err, "[certs] certificate %s not signed by CA certificate %s", cert.BaseName, caCert.BaseName)
 			}
 
 			fmt.Printf("[certs] Using existing %s certificate and key on disk\n", cert.BaseName)
 			return nil
-		}
-
-		if csrOnly {
-			fmt.Printf("[certs] Generating CSR for %s instead of certificate\n", cert.BaseName)
-			if csrDir == "" {
-				csrDir = data.CertificateWriteDir()
-			}
-
-			return certsphase.CreateCSR(cert, data.Cfg(), csrDir)
 		}
 
 		// if dryrunning, write certificates to a temporary folder (and defer restore to the path originally specified by the user)

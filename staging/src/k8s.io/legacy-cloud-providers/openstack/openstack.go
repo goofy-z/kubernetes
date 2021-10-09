@@ -1,3 +1,4 @@
+//go:build !providerless
 // +build !providerless
 
 /*
@@ -25,7 +26,6 @@ import (
 	"fmt"
 	"io"
 	"io/ioutil"
-	"net"
 	"net/http"
 	"os"
 	"reflect"
@@ -53,6 +53,7 @@ import (
 	cloudprovider "k8s.io/cloud-provider"
 	nodehelpers "k8s.io/cloud-provider/node/helpers"
 	"k8s.io/klog/v2"
+	netutils "k8s.io/utils/net"
 )
 
 const (
@@ -158,7 +159,7 @@ type Config struct {
 		AuthURL         string `gcfg:"auth-url"`
 		Username        string
 		UserID          string `gcfg:"user-id"`
-		Password        string
+		Password        string `datapolicy:"password"`
 		TenantID        string `gcfg:"tenant-id"`
 		TenantName      string `gcfg:"tenant-name"`
 		TrustID         string `gcfg:"trust-id"`
@@ -642,14 +643,14 @@ func getAddressByName(client *gophercloud.ServiceClient, name types.NodeName, ne
 	}
 
 	for _, addr := range addrs {
-		isIPv6 := net.ParseIP(addr.Address).To4() == nil
+		isIPv6 := netutils.ParseIPSloppy(addr.Address).To4() == nil
 		if (addr.Type == v1.NodeInternalIP) && (isIPv6 == needIPv6) {
 			return addr.Address, nil
 		}
 	}
 
 	for _, addr := range addrs {
-		isIPv6 := net.ParseIP(addr.Address).To4() == nil
+		isIPv6 := netutils.ParseIPSloppy(addr.Address).To4() == nil
 		if (addr.Type == v1.NodeExternalIP) && (isIPv6 == needIPv6) {
 			return addr.Address, nil
 		}

@@ -31,8 +31,8 @@ import (
 )
 
 func TestIgnoreClusterName(t *testing.T) {
-	config := framework.NewMasterConfig()
-	_, s, closeFn := framework.RunAMaster(config)
+	config := framework.NewControlPlaneConfig()
+	_, s, closeFn := framework.RunAnAPIServer(config)
 	defer closeFn()
 
 	client := clientset.NewForConfigOrDie(&restclient.Config{Host: s.URL, ContentConfig: restclient.ContentConfig{GroupVersion: &schema.GroupVersion{Group: "", Version: "v1"}}})
@@ -43,12 +43,12 @@ func TestIgnoreClusterName(t *testing.T) {
 		},
 	}
 	nsNew, err := client.CoreV1().Namespaces().Create(context.TODO(), &ns, metav1.CreateOptions{})
-	assert.Nil(t, err)
+	assert.NoError(t, err)
 	assert.Equal(t, ns.Name, nsNew.Name)
 	assert.Empty(t, nsNew.ClusterName)
 
 	nsNew, err = client.CoreV1().Namespaces().Update(context.TODO(), &ns, metav1.UpdateOptions{})
-	assert.Nil(t, err)
+	assert.NoError(t, err)
 	assert.Equal(t, ns.Name, nsNew.Name)
 	assert.Empty(t, nsNew.ClusterName)
 }

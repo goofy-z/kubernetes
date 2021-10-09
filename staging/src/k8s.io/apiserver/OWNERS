@@ -17,10 +17,10 @@ reviewers:
 - ncdc
 - enj
 - hzxuzhonghu
-- CaoShuFeng
 - jennybuckley
 - apelisse
 - jpbetz
+- tkashem
 labels:
 - sig/api-machinery
 - area/apiserver

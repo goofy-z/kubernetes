@@ -17,6 +17,7 @@ limitations under the License.
 package fuzzer
 
 import (
+	"math/rand"
 	"time"
 
 	"github.com/google/gofuzz"
@@ -24,11 +25,12 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	runtimeserializer "k8s.io/apimachinery/pkg/runtime/serializer"
 	"k8s.io/kubelet/config/v1beta1"
+	"k8s.io/kubernetes/pkg/cluster/ports"
 	kubeletconfig "k8s.io/kubernetes/pkg/kubelet/apis/config"
 	kubeletconfigv1beta1 "k8s.io/kubernetes/pkg/kubelet/apis/config/v1beta1"
 	"k8s.io/kubernetes/pkg/kubelet/qos"
 	kubetypes "k8s.io/kubernetes/pkg/kubelet/types"
-	"k8s.io/kubernetes/pkg/master/ports"
+	utilpointer "k8s.io/utils/pointer"
 )
 
 // Funcs returns the fuzzer functions for the kubeletconfig apis.
@@ -62,14 +64,17 @@ func Funcs(codecs runtimeserializer.CodecFactory) []interface{} {
 			obj.KernelMemcgNotification = false
 			obj.MaxOpenFiles = 1000000
 			obj.MaxPods = 110
+			obj.MemoryManagerPolicy = v1beta1.NoneMemoryManagerPolicy
 			obj.PodPidsLimit = -1
 			obj.NodeStatusUpdateFrequency = metav1.Duration{Duration: 10 * time.Second}
 			obj.NodeStatusReportFrequency = metav1.Duration{Duration: time.Minute}
 			obj.NodeLeaseDurationSeconds = 40
 			obj.CPUManagerPolicy = "none"
+			obj.CPUManagerPolicyOptions = make(map[string]string)
 			obj.CPUManagerReconcilePeriod = obj.NodeStatusUpdateFrequency
 			obj.NodeStatusMaxImages = 50
 			obj.TopologyManagerPolicy = kubeletconfig.NoneTopologyManagerPolicy
+			obj.TopologyManagerScope = kubeletconfig.ContainerTopologyManagerScope
 			obj.QOSReserved = map[string]string{
 				"memory": "50%",
 			}
@@ -100,6 +105,11 @@ func Funcs(codecs runtimeserializer.CodecFactory) []interface{} {
 			obj.ConfigMapAndSecretChangeDetectionStrategy = "Watch"
 			obj.AllowedUnsafeSysctls = []string{}
 			obj.VolumePluginDir = kubeletconfigv1beta1.DefaultVolumePluginDir
+			if obj.Logging.Format == "" {
+				obj.Logging.Format = "text"
+			}
+			obj.EnableSystemLogHandler = true
+			obj.MemoryThrottlingFactor = utilpointer.Float64Ptr(rand.Float64())
 		},
 	}
 }

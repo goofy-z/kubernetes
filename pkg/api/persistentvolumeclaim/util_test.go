@@ -21,7 +21,8 @@ import (
 	"reflect"
 	"testing"
 
-	"k8s.io/apimachinery/pkg/util/diff"
+	"github.com/google/go-cmp/cmp"
+
 	utilfeature "k8s.io/apiserver/pkg/util/feature"
 	featuregatetesting "k8s.io/component-base/featuregate/testing"
 	"k8s.io/kubernetes/pkg/apis/core"
@@ -50,76 +51,44 @@ func TestDropDisabledSnapshotDataSource(t *testing.T) {
 	}
 
 	pvcInfo := []struct {
-		description   string
-		hasDataSource bool
-		pvc           func() *core.PersistentVolumeClaim
+		description string
+		pvc         func() *core.PersistentVolumeClaim
 	}{
 		{
-			description:   "pvc without DataSource",
-			hasDataSource: false,
-			pvc:           pvcWithoutDataSource,
+			description: "pvc without DataSource",
+			pvc:         pvcWithoutDataSource,
 		},
 		{
-			description:   "pvc with DataSource",
-			hasDataSource: true,
-			pvc:           pvcWithDataSource,
+			description: "pvc with DataSource",
+			pvc:         pvcWithDataSource,
 		},
 		{
-			description:   "is nil",
-			hasDataSource: false,
-			pvc:           func() *core.PersistentVolumeClaim { return nil },
+			description: "is nil",
+			pvc:         func() *core.PersistentVolumeClaim { return nil },
 		},
 	}
 
-	// Ensure that any data sources aren't enabled for this test
-	defer featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, features.AnyVolumeDataSource, false)()
+	for _, oldpvcInfo := range pvcInfo {
+		for _, newpvcInfo := range pvcInfo {
+			oldpvc := oldpvcInfo.pvc()
+			newpvc := newpvcInfo.pvc()
+			if newpvc == nil {
+				continue
+			}
 
-	for _, enabled := range []bool{true, false} {
-		for _, oldpvcInfo := range pvcInfo {
-			for _, newpvcInfo := range pvcInfo {
-				oldPvcHasDataSource, oldpvc := oldpvcInfo.hasDataSource, oldpvcInfo.pvc()
-				newPvcHasDataSource, newpvc := newpvcInfo.hasDataSource, newpvcInfo.pvc()
-				if newpvc == nil {
-					continue
+			t.Run(fmt.Sprintf("old pvc %v, new pvc %v", oldpvcInfo.description, newpvcInfo.description), func(t *testing.T) {
+				EnforceDataSourceBackwardsCompatibility(&newpvc.Spec, nil)
+
+				// old pvc should never be changed
+				if !reflect.DeepEqual(oldpvc, oldpvcInfo.pvc()) {
+					t.Errorf("old pvc changed: %v", cmp.Diff(oldpvc, oldpvcInfo.pvc()))
 				}
 
-				t.Run(fmt.Sprintf("feature enabled=%v, old pvc %v, new pvc %v", enabled, oldpvcInfo.description, newpvcInfo.description), func(t *testing.T) {
-					defer featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, features.VolumeSnapshotDataSource, enabled)()
-
-					var oldpvcSpec *core.PersistentVolumeClaimSpec
-					if oldpvc != nil {
-						oldpvcSpec = &oldpvc.Spec
-					}
-					DropDisabledFields(&newpvc.Spec, oldpvcSpec)
-
-					// old pvc should never be changed
-					if !reflect.DeepEqual(oldpvc, oldpvcInfo.pvc()) {
-						t.Errorf("old pvc changed: %v", diff.ObjectReflectDiff(oldpvc, oldpvcInfo.pvc()))
-					}
-
-					switch {
-					case enabled || oldPvcHasDataSource:
-						// new pvc should not be changed if the feature is enabled, or if the old pvc had DataSource
-						if !reflect.DeepEqual(newpvc, newpvcInfo.pvc()) {
-							t.Errorf("new pvc changed: %v", diff.ObjectReflectDiff(newpvc, newpvcInfo.pvc()))
-						}
-					case newPvcHasDataSource:
-						// new pvc should be changed
-						if reflect.DeepEqual(newpvc, newpvcInfo.pvc()) {
-							t.Errorf("new pvc was not changed")
-						}
-						// new pvc should not have DataSource
-						if !reflect.DeepEqual(newpvc, pvcWithoutDataSource()) {
-							t.Errorf("new pvc had DataSource: %v", diff.ObjectReflectDiff(newpvc, pvcWithoutDataSource()))
-						}
-					default:
-						// new pvc should not need to be changed
-						if !reflect.DeepEqual(newpvc, newpvcInfo.pvc()) {
-							t.Errorf("new pvc changed: %v", diff.ObjectReflectDiff(newpvc, newpvcInfo.pvc()))
-						}
-					}
-				})
-			}
+				// new pvc should not be changed
+				if !reflect.DeepEqual(newpvc, newpvcInfo.pvc()) {
+					t.Errorf("new pvc changed: %v", cmp.Diff(newpvc, newpvcInfo.pvc()))
+				}
+			})
 		}
 	}
 }
@@ -172,20 +141,15 @@ func TestPVCDataSourceSpecFilter(t *testing.T) {
 		},
 	}
 
-	// Ensure that any data sources aren't enabled for this test
-	defer featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, features.AnyVolumeDataSource, false)()
-
 	for testName, test := range tests {
 		t.Run(testName, func(t *testing.T) {
-			DropDisabledFields(&test.spec, nil)
+			EnforceDataSourceBackwardsCompatibility(&test.spec, nil)
 			if test.spec.DataSource != test.want {
 				t.Errorf("expected drop datasource condition was not met, test: %s, spec: %v, expected: %v", testName, test.spec, test.want)
 			}
 
 		})
-
 	}
-
 }
 
 // TestAnyDataSourceFilter checks to ensure the AnyVolumeDataSource feature gate works
@@ -199,95 +163,127 @@ func TestAnyDataSourceFilter(t *testing.T) {
 	}
 
 	volumeDataSource := makeDataSource("", "PersistentVolumeClaim", "my-vol")
-	snapshotDataSource := makeDataSource("snapshot.storage.k8s.io", "VolumeSnapshot", "my-snap")
-	genericDataSource := makeDataSource("generic.storage.k8s.io", "Generic", "my-foo")
 
 	var tests = map[string]struct {
-		spec            core.PersistentVolumeClaimSpec
-		snapshotEnabled bool
-		anyEnabled      bool
-		want            *core.TypedLocalObjectReference
+		spec       core.PersistentVolumeClaimSpec
+		anyEnabled bool
+		want       *core.TypedLocalObjectReference
+		wantRef    *core.TypedLocalObjectReference
 	}{
-		"both disabled with empty ds": {
+		"any disabled with empty ds": {
 			spec: core.PersistentVolumeClaimSpec{},
-			want: nil,
 		},
-		"both disabled with volume ds": {
+		"any disabled with volume ds": {
 			spec: core.PersistentVolumeClaimSpec{DataSource: volumeDataSource},
 			want: volumeDataSource,
 		},
-		"both disabled with snapshot ds": {
-			spec: core.PersistentVolumeClaimSpec{DataSource: snapshotDataSource},
-			want: nil,
+		"any disabled with volume ds ref": {
+			spec: core.PersistentVolumeClaimSpec{DataSourceRef: volumeDataSource},
 		},
-		"both disabled with generic ds": {
-			spec: core.PersistentVolumeClaimSpec{DataSource: genericDataSource},
-			want: nil,
+		"any disabled with both data sources": {
+			spec: core.PersistentVolumeClaimSpec{DataSource: volumeDataSource, DataSourceRef: volumeDataSource},
+			want: volumeDataSource,
 		},
 		"any enabled with empty ds": {
 			spec:       core.PersistentVolumeClaimSpec{},
 			anyEnabled: true,
-			want:       nil,
 		},
 		"any enabled with volume ds": {
 			spec:       core.PersistentVolumeClaimSpec{DataSource: volumeDataSource},
 			anyEnabled: true,
 			want:       volumeDataSource,
 		},
-		"any enabled with snapshot ds": {
-			spec:       core.PersistentVolumeClaimSpec{DataSource: snapshotDataSource},
+		"any enabled with volume ds ref": {
+			spec:       core.PersistentVolumeClaimSpec{DataSourceRef: volumeDataSource},
 			anyEnabled: true,
-			want:       snapshotDataSource,
+			wantRef:    volumeDataSource,
 		},
-		"any enabled with generic ds": {
-			spec:       core.PersistentVolumeClaimSpec{DataSource: genericDataSource},
+		"any enabled with both data sources": {
+			spec:       core.PersistentVolumeClaimSpec{DataSource: volumeDataSource, DataSourceRef: volumeDataSource},
 			anyEnabled: true,
-			want:       genericDataSource,
-		},
-		"snapshot enabled with snapshot ds": {
-			spec:            core.PersistentVolumeClaimSpec{DataSource: snapshotDataSource},
-			snapshotEnabled: true,
-			want:            snapshotDataSource,
-		},
-		"snapshot enabled with generic ds": {
-			spec:            core.PersistentVolumeClaimSpec{DataSource: genericDataSource},
-			snapshotEnabled: true,
-			want:            nil,
-		},
-		"both enabled with empty ds": {
-			spec:            core.PersistentVolumeClaimSpec{},
-			snapshotEnabled: true,
-			anyEnabled:      true,
-			want:            nil,
-		},
-		"both enabled with volume ds": {
-			spec:            core.PersistentVolumeClaimSpec{DataSource: volumeDataSource},
-			snapshotEnabled: true,
-			anyEnabled:      true,
-			want:            volumeDataSource,
-		},
-		"both enabled with snapshot ds": {
-			spec:            core.PersistentVolumeClaimSpec{DataSource: snapshotDataSource},
-			snapshotEnabled: true,
-			anyEnabled:      true,
-			want:            snapshotDataSource,
-		},
-		"both enabled with generic ds": {
-			spec:            core.PersistentVolumeClaimSpec{DataSource: genericDataSource},
-			snapshotEnabled: true,
-			anyEnabled:      true,
-			want:            genericDataSource,
+			want:       volumeDataSource,
+			wantRef:    volumeDataSource,
 		},
 	}
 
 	for testName, test := range tests {
 		t.Run(testName, func(t *testing.T) {
-			defer featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, features.VolumeSnapshotDataSource, test.snapshotEnabled)()
 			defer featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, features.AnyVolumeDataSource, test.anyEnabled)()
-			DropDisabledFields(&test.spec, nil)
-			if test.spec.DataSource != test.want {
-				t.Errorf("expected condition was not met, test: %s, snapshotEnabled: %v, anyEnabled: %v, spec: %v, expected: %v",
-					testName, test.snapshotEnabled, test.anyEnabled, test.spec, test.want)
+			DropDisabledFields(&test.spec)
+			if test.spec.DataSource != test.want || test.spec.DataSourceRef != test.wantRef {
+				t.Errorf("expected condition was not met, test: %s, anyEnabled: %v, spec: %v, expected: %v %v",
+					testName, test.anyEnabled, test.spec, test.want, test.wantRef)
+			}
+		})
+	}
+}
+
+// TestDataSourceRef checks to ensure the DataSourceRef field handles backwards
+// compatibility with the DataSource field
+func TestDataSourceRef(t *testing.T) {
+	makeDataSource := func(apiGroup, kind, name string) *core.TypedLocalObjectReference {
+		return &core.TypedLocalObjectReference{
+			APIGroup: &apiGroup,
+			Kind:     kind,
+			Name:     name,
+		}
+	}
+
+	volumeDataSource := makeDataSource("", "PersistentVolumeClaim", "my-vol")
+	snapshotDataSource := makeDataSource("snapshot.storage.k8s.io", "VolumeSnapshot", "my-snap")
+	genericDataSource := makeDataSource("generic.storage.k8s.io", "Generic", "my-foo")
+	coreDataSource := makeDataSource("", "Pod", "my-pod")
+
+	var tests = map[string]struct {
+		spec core.PersistentVolumeClaimSpec
+		want *core.TypedLocalObjectReference
+	}{
+		"empty ds": {
+			spec: core.PersistentVolumeClaimSpec{},
+		},
+		"volume ds": {
+			spec: core.PersistentVolumeClaimSpec{DataSource: volumeDataSource},
+			want: volumeDataSource,
+		},
+		"snapshot ds": {
+			spec: core.PersistentVolumeClaimSpec{DataSource: snapshotDataSource},
+			want: snapshotDataSource,
+		},
+		"generic ds": {
+			spec: core.PersistentVolumeClaimSpec{DataSource: genericDataSource},
+			want: genericDataSource,
+		},
+		"core ds": {
+			spec: core.PersistentVolumeClaimSpec{DataSource: coreDataSource},
+			want: coreDataSource,
+		},
+		"volume ds ref": {
+			spec: core.PersistentVolumeClaimSpec{DataSourceRef: volumeDataSource},
+			want: volumeDataSource,
+		},
+		"snapshot ds ref": {
+			spec: core.PersistentVolumeClaimSpec{DataSourceRef: snapshotDataSource},
+			want: snapshotDataSource,
+		},
+		"generic ds ref": {
+			spec: core.PersistentVolumeClaimSpec{DataSourceRef: genericDataSource},
+			want: genericDataSource,
+		},
+		"core ds ref": {
+			spec: core.PersistentVolumeClaimSpec{DataSourceRef: coreDataSource},
+			want: coreDataSource,
+		},
+	}
+
+	defer featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, features.AnyVolumeDataSource, true)()
+
+	for testName, test := range tests {
+		t.Run(testName, func(t *testing.T) {
+			NormalizeDataSources(&test.spec)
+			if !reflect.DeepEqual(test.spec.DataSource, test.want) ||
+				!reflect.DeepEqual(test.spec.DataSourceRef, test.want) {
+				t.Errorf("expected condition was not met, test: %s, spec: %v, expected: %v",
+					testName, test.spec, test.want)
 			}
 		})
 	}

@@ -40,16 +40,18 @@ import (
 	restclient "k8s.io/client-go/rest"
 	featuregatetesting "k8s.io/component-base/featuregate/testing"
 	"k8s.io/klog/v2"
+	"k8s.io/kube-scheduler/config/v1beta3"
 	podutil "k8s.io/kubernetes/pkg/api/v1/pod"
 	"k8s.io/kubernetes/pkg/apis/scheduling"
 	"k8s.io/kubernetes/pkg/features"
 	"k8s.io/kubernetes/pkg/scheduler"
-	schedulerconfig "k8s.io/kubernetes/pkg/scheduler/apis/config"
+	configtesting "k8s.io/kubernetes/pkg/scheduler/apis/config/testing"
+	framework "k8s.io/kubernetes/pkg/scheduler/framework"
 	frameworkruntime "k8s.io/kubernetes/pkg/scheduler/framework/runtime"
-	framework "k8s.io/kubernetes/pkg/scheduler/framework/v1alpha1"
+	st "k8s.io/kubernetes/pkg/scheduler/testing"
 	"k8s.io/kubernetes/plugin/pkg/admission/priority"
 	testutils "k8s.io/kubernetes/test/integration/util"
-	"k8s.io/kubernetes/test/utils"
+	"k8s.io/utils/pointer"
 )
 
 var lowPriority, mediumPriority, highPriority = int32(100), int32(200), int32(300)
@@ -65,7 +67,7 @@ func waitForNominatedNodeNameWithTimeout(cs clientset.Interface, pod *v1.Pod, ti
 		}
 		return false, err
 	}); err != nil {
-		return fmt.Errorf("Pod %v/%v annotation did not get set: %v", pod.Namespace, pod.Name, err)
+		return fmt.Errorf(".status.nominatedNodeName of Pod %v/%v did not get set: %v", pod.Namespace, pod.Name, err)
 	}
 	return nil
 }
@@ -104,13 +106,13 @@ func (fp *tokenFilter) PreFilter(ctx context.Context, state *framework.CycleStat
 }
 
 func (fp *tokenFilter) AddPod(ctx context.Context, state *framework.CycleState, podToSchedule *v1.Pod,
-	podToAdd *v1.Pod, nodeInfo *framework.NodeInfo) *framework.Status {
+	podInfoToAdd *framework.PodInfo, nodeInfo *framework.NodeInfo) *framework.Status {
 	fp.Tokens--
 	return nil
 }
 
 func (fp *tokenFilter) RemovePod(ctx context.Context, state *framework.CycleState, podToSchedule *v1.Pod,
-	podToRemove *v1.Pod, nodeInfo *framework.NodeInfo) *framework.Status {
+	podInfoToRemove *framework.PodInfo, nodeInfo *framework.NodeInfo) *framework.Status {
 	fp.Tokens++
 	return nil
 }
@@ -126,31 +128,33 @@ func TestPreemption(t *testing.T) {
 	// Initialize scheduler with a filter plugin.
 	var filter tokenFilter
 	registry := make(frameworkruntime.Registry)
-	err := registry.Register(filterPluginName, func(_ runtime.Object, fh framework.FrameworkHandle) (framework.Plugin, error) {
+	err := registry.Register(filterPluginName, func(_ runtime.Object, fh framework.Handle) (framework.Plugin, error) {
 		return &filter, nil
 	})
 	if err != nil {
 		t.Fatalf("Error registering a filter: %v", err)
 	}
-	prof := schedulerconfig.KubeSchedulerProfile{
-		SchedulerName: v1.DefaultSchedulerName,
-		Plugins: &schedulerconfig.Plugins{
-			Filter: &schedulerconfig.PluginSet{
-				Enabled: []schedulerconfig.Plugin{
-					{Name: filterPluginName},
+	cfg := configtesting.V1beta3ToInternalWithDefaults(t, v1beta3.KubeSchedulerConfiguration{
+		Profiles: []v1beta3.KubeSchedulerProfile{{
+			SchedulerName: pointer.StringPtr(v1.DefaultSchedulerName),
+			Plugins: &v1beta3.Plugins{
+				Filter: v1beta3.PluginSet{
+					Enabled: []v1beta3.Plugin{
+						{Name: filterPluginName},
+					},
+				},
+				PreFilter: v1beta3.PluginSet{
+					Enabled: []v1beta3.Plugin{
+						{Name: filterPluginName},
+					},
 				},
 			},
-			PreFilter: &schedulerconfig.PluginSet{
-				Enabled: []schedulerconfig.Plugin{
-					{Name: filterPluginName},
-				},
-			},
-		},
-	}
+		}},
+	})
+
 	testCtx := testutils.InitTestSchedulerWithOptions(t,
-		testutils.InitTestMaster(t, "preemptiom", nil),
-		false, nil, time.Second,
-		scheduler.WithProfiles(prof),
+		testutils.InitTestAPIServer(t, "preemption", nil),
+		scheduler.WithProfiles(cfg.Profiles...),
 		scheduler.WithFrameworkOutOfTreeRegistry(registry))
 	testutils.SyncInformerFactory(testCtx)
 	go testCtx.Scheduler.Run(testCtx.Ctx)
@@ -379,21 +383,14 @@ func TestPreemption(t *testing.T) {
 	}
 
 	// Create a node with some resources and a label.
-	nodeRes := &v1.ResourceList{
-		v1.ResourcePods:   *resource.NewQuantity(32, resource.DecimalSI),
-		v1.ResourceCPU:    *resource.NewMilliQuantity(500, resource.DecimalSI),
-		v1.ResourceMemory: *resource.NewQuantity(500, resource.DecimalSI),
+	nodeRes := map[v1.ResourceName]string{
+		v1.ResourcePods:   "32",
+		v1.ResourceCPU:    "500m",
+		v1.ResourceMemory: "500",
 	}
-	node, err := createNode(testCtx.ClientSet, "node1", nodeRes)
-	if err != nil {
-		t.Fatalf("Error creating nodes: %v", err)
-	}
-	nodeLabels := map[string]string{"node": node.Name}
-	if err = utils.AddLabelsToNode(testCtx.ClientSet, node.Name, nodeLabels); err != nil {
-		t.Fatalf("Cannot add labels to node: %v", err)
-	}
-	if err = waitForNodeLabels(testCtx.ClientSet, node.Name, nodeLabels); err != nil {
-		t.Fatalf("Adding labels to node didn't succeed: %v", err)
+	nodeObject := st.MakeNode().Name("node1").Capacity(nodeRes).Label("node", "node1").Obj()
+	if _, err := createNode(testCtx.ClientSet, nodeObject); err != nil {
+		t.Fatalf("Error creating node: %v", err)
 	}
 
 	for _, test := range tests {
@@ -481,13 +478,13 @@ func TestNonPreemption(t *testing.T) {
 		},
 	})
 
-	// Create a node with some resources and a label.
-	nodeRes := &v1.ResourceList{
-		v1.ResourcePods:   *resource.NewQuantity(32, resource.DecimalSI),
-		v1.ResourceCPU:    *resource.NewMilliQuantity(500, resource.DecimalSI),
-		v1.ResourceMemory: *resource.NewQuantity(500, resource.DecimalSI),
+	// Create a node with some resources
+	nodeRes := map[v1.ResourceName]string{
+		v1.ResourcePods:   "32",
+		v1.ResourceCPU:    "500m",
+		v1.ResourceMemory: "500",
 	}
-	_, err := createNode(testCtx.ClientSet, "node1", nodeRes)
+	_, err := createNode(testCtx.ClientSet, st.MakeNode().Name("node1").Capacity(nodeRes).Obj())
 	if err != nil {
 		t.Fatalf("Error creating nodes: %v", err)
 	}
@@ -557,13 +554,13 @@ func TestDisablePreemption(t *testing.T) {
 		},
 	}
 
-	// Create a node with some resources and a label.
-	nodeRes := &v1.ResourceList{
-		v1.ResourcePods:   *resource.NewQuantity(32, resource.DecimalSI),
-		v1.ResourceCPU:    *resource.NewMilliQuantity(500, resource.DecimalSI),
-		v1.ResourceMemory: *resource.NewQuantity(500, resource.DecimalSI),
+	// Create a node with some resources
+	nodeRes := map[v1.ResourceName]string{
+		v1.ResourcePods:   "32",
+		v1.ResourceCPU:    "500m",
+		v1.ResourceMemory: "500",
 	}
-	_, err := createNode(testCtx.ClientSet, "node1", nodeRes)
+	_, err := createNode(testCtx.ClientSet, st.MakeNode().Name("node1").Capacity(nodeRes).Obj())
 	if err != nil {
 		t.Fatalf("Error creating nodes: %v", err)
 	}
@@ -603,7 +600,7 @@ func TestDisablePreemption(t *testing.T) {
 // This test verifies that system critical priorities are created automatically and resolved properly.
 func TestPodPriorityResolution(t *testing.T) {
 	admission := priority.NewPlugin()
-	testCtx := testutils.InitTestScheduler(t, testutils.InitTestMaster(t, "preemption", admission), true, nil)
+	testCtx := testutils.InitTestScheduler(t, testutils.InitTestAPIServer(t, "preemption", admission))
 	defer testutils.CleanupTest(t, testCtx)
 	cs := testCtx.ClientSet
 
@@ -660,17 +657,17 @@ func TestPodPriorityResolution(t *testing.T) {
 				Namespace:         metav1.NamespaceSystem,
 				PriorityClassName: "foo",
 			}),
-			ExpectedError: fmt.Errorf("Error creating pause pod: pods \"pod3-system-cluster-critical\" is forbidden: no PriorityClass with name foo was found"),
+			ExpectedError: fmt.Errorf("failed to create pause pod: pods \"pod3-system-cluster-critical\" is forbidden: no PriorityClass with name foo was found"),
 		},
 	}
 
-	// Create a node with some resources and a label.
-	nodeRes := &v1.ResourceList{
-		v1.ResourcePods:   *resource.NewQuantity(32, resource.DecimalSI),
-		v1.ResourceCPU:    *resource.NewMilliQuantity(500, resource.DecimalSI),
-		v1.ResourceMemory: *resource.NewQuantity(500, resource.DecimalSI),
+	// Create a node with some resources
+	nodeRes := map[v1.ResourceName]string{
+		v1.ResourcePods:   "32",
+		v1.ResourceCPU:    "500m",
+		v1.ResourceMemory: "500",
 	}
-	_, err := createNode(testCtx.ClientSet, "node1", nodeRes)
+	_, err := createNode(testCtx.ClientSet, st.MakeNode().Name("node1").Capacity(nodeRes).Obj())
 	if err != nil {
 		t.Fatalf("Error creating nodes: %v", err)
 	}
@@ -754,13 +751,13 @@ func TestPreemptionStarvation(t *testing.T) {
 		},
 	}
 
-	// Create a node with some resources and a label.
-	nodeRes := &v1.ResourceList{
-		v1.ResourcePods:   *resource.NewQuantity(32, resource.DecimalSI),
-		v1.ResourceCPU:    *resource.NewMilliQuantity(500, resource.DecimalSI),
-		v1.ResourceMemory: *resource.NewQuantity(500, resource.DecimalSI),
+	// Create a node with some resources
+	nodeRes := map[v1.ResourceName]string{
+		v1.ResourcePods:   "32",
+		v1.ResourceCPU:    "500m",
+		v1.ResourceMemory: "500",
 	}
-	_, err := createNode(testCtx.ClientSet, "node1", nodeRes)
+	_, err := createNode(testCtx.ClientSet, st.MakeNode().Name("node1").Capacity(nodeRes).Obj())
 	if err != nil {
 		t.Fatalf("Error creating nodes: %v", err)
 	}
@@ -802,9 +799,9 @@ func TestPreemptionStarvation(t *testing.T) {
 			if err != nil {
 				t.Errorf("Error while creating the preempting pod: %v", err)
 			}
-			// Check that the preemptor pod gets the annotation for nominated node name.
+			// Check if .status.nominatedNodeName of the preemptor pod gets set.
 			if err := waitForNominatedNodeName(cs, preemptor); err != nil {
-				t.Errorf("NominatedNodeName annotation was not set for pod %v/%v: %v", preemptor.Namespace, preemptor.Name, err)
+				t.Errorf(".status.nominatedNodeName was not set for pod %v/%v: %v", preemptor.Namespace, preemptor.Name, err)
 			}
 			// Make sure that preemptor is scheduled after preemptions.
 			if err := testutils.WaitForPodToScheduleWithTimeout(cs, preemptor, 60*time.Second); err != nil {
@@ -855,13 +852,13 @@ func TestPreemptionRaces(t *testing.T) {
 		},
 	}
 
-	// Create a node with some resources and a label.
-	nodeRes := &v1.ResourceList{
-		v1.ResourcePods:   *resource.NewQuantity(100, resource.DecimalSI),
-		v1.ResourceCPU:    *resource.NewMilliQuantity(5000, resource.DecimalSI),
-		v1.ResourceMemory: *resource.NewQuantity(5000, resource.DecimalSI),
+	// Create a node with some resources
+	nodeRes := map[v1.ResourceName]string{
+		v1.ResourcePods:   "100",
+		v1.ResourceCPU:    "5000m",
+		v1.ResourceMemory: "5000",
 	}
-	_, err := createNode(testCtx.ClientSet, "node1", nodeRes)
+	_, err := createNode(testCtx.ClientSet, st.MakeNode().Name("node1").Capacity(nodeRes).Obj())
 	if err != nil {
 		t.Fatalf("Error creating nodes: %v", err)
 	}
@@ -903,7 +900,7 @@ func TestPreemptionRaces(t *testing.T) {
 				}
 				// Check that the preemptor pod gets nominated node name.
 				if err := waitForNominatedNodeName(cs, preemptor); err != nil {
-					t.Errorf("NominatedNodeName annotation was not set for pod %v/%v: %v", preemptor.Namespace, preemptor.Name, err)
+					t.Errorf(".status.nominatedNodeName was not set for pod %v/%v: %v", preemptor.Namespace, preemptor.Name, err)
 				}
 				// Make sure that preemptor is scheduled after preemptions.
 				if err := testutils.WaitForPodToScheduleWithTimeout(cs, preemptor, 60*time.Second); err != nil {
@@ -954,13 +951,13 @@ func TestNominatedNodeCleanUp(t *testing.T) {
 
 	defer cleanupPodsInNamespace(cs, t, testCtx.NS.Name)
 
-	// Create a node with some resources and a label.
-	nodeRes := &v1.ResourceList{
-		v1.ResourcePods:   *resource.NewQuantity(32, resource.DecimalSI),
-		v1.ResourceCPU:    *resource.NewMilliQuantity(500, resource.DecimalSI),
-		v1.ResourceMemory: *resource.NewQuantity(500, resource.DecimalSI),
+	// Create a node with some resources
+	nodeRes := map[v1.ResourceName]string{
+		v1.ResourcePods:   "32",
+		v1.ResourceCPU:    "500m",
+		v1.ResourceMemory: "500",
 	}
-	_, err := createNode(testCtx.ClientSet, "node1", nodeRes)
+	_, err := createNode(testCtx.ClientSet, st.MakeNode().Name("node1").Capacity(nodeRes).Obj())
 	if err != nil {
 		t.Fatalf("Error creating nodes: %v", err)
 	}
@@ -993,9 +990,9 @@ func TestNominatedNodeCleanUp(t *testing.T) {
 	if err != nil {
 		t.Errorf("Error while creating the medium priority pod: %v", err)
 	}
-	// Step 3. Check that nominated node name of the medium priority pod is set.
+	// Step 3. Check if .status.nominatedNodeName of the medium priority pod is set.
 	if err := waitForNominatedNodeName(cs, medPriPod); err != nil {
-		t.Errorf("NominatedNodeName annotation was not set for pod %v/%v: %v", medPriPod.Namespace, medPriPod.Name, err)
+		t.Errorf(".status.nominatedNodeName was not set for pod %v/%v: %v", medPriPod.Namespace, medPriPod.Name, err)
 	}
 	// Step 4. Create a high priority pod.
 	podConf = initPausePod(&pausePodConfig{
@@ -1011,11 +1008,11 @@ func TestNominatedNodeCleanUp(t *testing.T) {
 	if err != nil {
 		t.Errorf("Error while creating the high priority pod: %v", err)
 	}
-	// Step 5. Check that nominated node name of the high priority pod is set.
+	// Step 5. Check if .status.nominatedNodeName of the high priority pod is set.
 	if err := waitForNominatedNodeName(cs, highPriPod); err != nil {
-		t.Errorf("NominatedNodeName annotation was not set for pod %v/%v: %v", highPriPod.Namespace, highPriPod.Name, err)
+		t.Errorf(".status.nominatedNodeName was not set for pod %v/%v: %v", highPriPod.Namespace, highPriPod.Name, err)
 	}
-	// And the nominated node name of the medium priority pod is cleared.
+	// And .status.nominatedNodeName of the medium priority pod is cleared.
 	if err := wait.Poll(100*time.Millisecond, wait.ForeverTestTimeout, func() (bool, error) {
 		pod, err := cs.CoreV1().Pods(medPriPod.Namespace).Get(context.TODO(), medPriPod.Name, metav1.GetOptions{})
 		if err != nil {
@@ -1026,7 +1023,7 @@ func TestNominatedNodeCleanUp(t *testing.T) {
 		}
 		return false, err
 	}); err != nil {
-		t.Errorf("The nominated node name of the medium priority pod was not cleared: %v", err)
+		t.Errorf(".status.nominatedNodeName of the medium priority pod was not cleared: %v", err)
 	}
 }
 
@@ -1069,15 +1066,15 @@ func TestPDBInPreemption(t *testing.T) {
 		v1.ResourceCPU:    *resource.NewMilliQuantity(100, resource.DecimalSI),
 		v1.ResourceMemory: *resource.NewQuantity(100, resource.DecimalSI)},
 	}
-	defaultNodeRes := &v1.ResourceList{
-		v1.ResourcePods:   *resource.NewQuantity(32, resource.DecimalSI),
-		v1.ResourceCPU:    *resource.NewMilliQuantity(500, resource.DecimalSI),
-		v1.ResourceMemory: *resource.NewQuantity(500, resource.DecimalSI),
+	defaultNodeRes := map[v1.ResourceName]string{
+		v1.ResourcePods:   "32",
+		v1.ResourceCPU:    "500m",
+		v1.ResourceMemory: "500",
 	}
 
 	type nodeConfig struct {
 		name string
-		res  *v1.ResourceList
+		res  map[v1.ResourceName]string
 	}
 
 	tests := []struct {
@@ -1253,7 +1250,7 @@ func TestPDBInPreemption(t *testing.T) {
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
 			for _, nodeConf := range test.nodes {
-				_, err := createNode(cs, nodeConf.name, nodeConf.res)
+				_, err := createNode(cs, st.MakeNode().Name(nodeConf.name).Capacity(nodeConf.res).Obj())
 				if err != nil {
 					t.Fatalf("Error creating node %v: %v", nodeConf.name, err)
 				}
@@ -1306,10 +1303,10 @@ func TestPDBInPreemption(t *testing.T) {
 					}
 				}
 			}
-			// Also check that the preemptor pod gets the annotation for nominated node name.
+			// Also check if .status.nominatedNodeName of the preemptor pod gets set.
 			if len(test.preemptedPodIndexes) > 0 {
 				if err := waitForNominatedNodeName(cs, preemptor); err != nil {
-					t.Errorf("Test [%v]: NominatedNodeName annotation was not set for pod %v/%v: %v", test.name, preemptor.Namespace, preemptor.Name, err)
+					t.Errorf("Test [%v]: .status.nominatedNodeName was not set for pod %v/%v: %v", test.name, preemptor.Namespace, preemptor.Name, err)
 				}
 			}
 
@@ -1317,6 +1314,155 @@ func TestPDBInPreemption(t *testing.T) {
 			pods = append(pods, preemptor)
 			testutils.CleanupPods(cs, t, pods)
 			cs.PolicyV1beta1().PodDisruptionBudgets(testCtx.NS.Name).DeleteCollection(context.TODO(), metav1.DeleteOptions{}, metav1.ListOptions{})
+			cs.CoreV1().Nodes().DeleteCollection(context.TODO(), metav1.DeleteOptions{}, metav1.ListOptions{})
+		})
+	}
+}
+
+func initTestPreferNominatedNode(t *testing.T, nsPrefix string, opts ...scheduler.Option) *testutils.TestContext {
+	testCtx := testutils.InitTestSchedulerWithOptions(t, testutils.InitTestAPIServer(t, nsPrefix, nil), opts...)
+	testutils.SyncInformerFactory(testCtx)
+	// wraps the NextPod() method to make it appear the preemption has been done already and the nominated node has been set.
+	f := testCtx.Scheduler.NextPod
+	testCtx.Scheduler.NextPod = func() (podInfo *framework.QueuedPodInfo) {
+		podInfo = f()
+		podInfo.Pod.Status.NominatedNodeName = "node-1"
+		return podInfo
+	}
+	go testCtx.Scheduler.Run(testCtx.Ctx)
+	return testCtx
+}
+
+// TestPreferNominatedNode test when the feature of "PreferNominatedNode" is enabled, the overall scheduling logic is not changed.
+// If the nominated node pass all the filters, then preemptor pod will run on the nominated node, otherwise, it will be scheduled
+// to another node in the cluster that ables to pass all the filters.
+// NOTE: This integration test is not intending to check the logic of preemption, but rather a sanity check when the feature is
+// enabled.
+func TestPreferNominatedNode(t *testing.T) {
+	defer featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, features.PreferNominatedNode, true)()
+	testCtx := initTestPreferNominatedNode(t, "perfer-nominated-node")
+	t.Cleanup(func() {
+		testutils.CleanupTest(t, testCtx)
+	})
+	cs := testCtx.ClientSet
+	defaultPodRes := &v1.ResourceRequirements{Requests: v1.ResourceList{
+		v1.ResourceCPU:    *resource.NewMilliQuantity(100, resource.DecimalSI),
+		v1.ResourceMemory: *resource.NewQuantity(100, resource.DecimalSI)},
+	}
+	defaultNodeRes := map[v1.ResourceName]string{
+		v1.ResourcePods:   "32",
+		v1.ResourceCPU:    "500m",
+		v1.ResourceMemory: "500",
+	}
+
+	type nodeConfig struct {
+		name string
+		res  map[v1.ResourceName]string
+	}
+
+	tests := []struct {
+		name         string
+		nodes        []*nodeConfig
+		existingPods []*v1.Pod
+		pod          *v1.Pod
+		runnningNode string
+	}{
+		{
+			name: "nominated node released all resource, preemptor is scheduled to the nominated node",
+			nodes: []*nodeConfig{
+				{name: "node-1", res: defaultNodeRes},
+				{name: "node-2", res: defaultNodeRes},
+			},
+			existingPods: []*v1.Pod{
+				initPausePod(&pausePodConfig{
+					Name:      "low-pod1",
+					Namespace: testCtx.NS.Name,
+					Priority:  &lowPriority,
+					NodeName:  "node-2",
+					Resources: defaultPodRes,
+				}),
+			},
+			pod: initPausePod(&pausePodConfig{
+				Name:      "preemptor-pod",
+				Namespace: testCtx.NS.Name,
+				Priority:  &highPriority,
+				Resources: &v1.ResourceRequirements{Requests: v1.ResourceList{
+					v1.ResourceCPU:    *resource.NewMilliQuantity(500, resource.DecimalSI),
+					v1.ResourceMemory: *resource.NewQuantity(200, resource.DecimalSI)},
+				},
+			}),
+			runnningNode: "node-1",
+		},
+		{
+			name: "nominated node cannot pass all the filters, preemptor should find a different node",
+			nodes: []*nodeConfig{
+				{name: "node-1", res: defaultNodeRes},
+				{name: "node-2", res: defaultNodeRes},
+			},
+			existingPods: []*v1.Pod{
+				initPausePod(&pausePodConfig{
+					Name:      "low-pod1",
+					Namespace: testCtx.NS.Name,
+					Priority:  &lowPriority,
+					Resources: defaultPodRes,
+					NodeName:  "node-1",
+				}),
+			},
+			pod: initPausePod(&pausePodConfig{
+				Name:      "preemptor-pod",
+				Namespace: testCtx.NS.Name,
+				Priority:  &highPriority,
+				Resources: &v1.ResourceRequirements{Requests: v1.ResourceList{
+					v1.ResourceCPU:    *resource.NewMilliQuantity(500, resource.DecimalSI),
+					v1.ResourceMemory: *resource.NewQuantity(200, resource.DecimalSI)},
+				},
+			}),
+			runnningNode: "node-2",
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			var err error
+			var preemptor *v1.Pod
+			for _, nodeConf := range test.nodes {
+				_, err := createNode(cs, st.MakeNode().Name(nodeConf.name).Capacity(nodeConf.res).Obj())
+				if err != nil {
+					t.Fatalf("Error creating node %v: %v", nodeConf.name, err)
+				}
+			}
+			pods := make([]*v1.Pod, len(test.existingPods))
+			// Create and run existingPods.
+			for i, p := range test.existingPods {
+				pods[i], err = runPausePod(cs, p)
+				if err != nil {
+					t.Fatalf("Error running pause pod: %v", err)
+				}
+			}
+			preemptor, err = createPausePod(cs, test.pod)
+			if err != nil {
+				t.Errorf("Error while creating high priority pod: %v", err)
+			}
+			err = wait.Poll(100*time.Millisecond, wait.ForeverTestTimeout, func() (bool, error) {
+				preemptor, err = cs.CoreV1().Pods(test.pod.Namespace).Get(context.TODO(), test.pod.Name, metav1.GetOptions{})
+				if err != nil {
+					t.Errorf("Error getting the preemptor pod info: %v", err)
+				}
+				if len(preemptor.Spec.NodeName) == 0 {
+					return false, err
+				}
+				return true, nil
+			})
+			if err != nil {
+				t.Errorf("Cannot schedule Pod %v/%v, error: %v", test.pod.Namespace, test.pod.Name, err)
+			}
+			// Make sure the pod has been scheduled to the right node.
+			if preemptor.Spec.NodeName != test.runnningNode {
+				t.Errorf("Expect pod running on %v, got %v.", test.runnningNode, preemptor.Spec.NodeName)
+			}
+			pods = append(pods, preemptor)
+			// cleanup
+			defer testutils.CleanupPods(cs, t, pods)
 			cs.CoreV1().Nodes().DeleteCollection(context.TODO(), metav1.DeleteOptions{}, metav1.ListOptions{})
 		})
 	}

@@ -1,3 +1,4 @@
+//go:build linux
 // +build linux
 
 /*
@@ -19,24 +20,23 @@ limitations under the License.
 package preflight
 
 import (
+	"syscall"
+
 	"github.com/pkg/errors"
-	kubeadmutil "k8s.io/kubernetes/cmd/kubeadm/app/util"
-	"k8s.io/utils/exec"
 )
 
-// Check validates if Docker is setup to use systemd as the cgroup driver.
-func (idsc IsDockerSystemdCheck) Check() (warnings, errorList []error) {
-	driver, err := kubeadmutil.GetCgroupDriverDocker(exec.New())
+// Check number of memory required by kubeadm
+func (mc MemCheck) Check() (warnings, errorList []error) {
+	info := syscall.Sysinfo_t{}
+	err := syscall.Sysinfo(&info)
 	if err != nil {
-		return nil, []error{err}
+		errorList = append(errorList, errors.Wrapf(err, "failed to get system info"))
 	}
-	if driver != kubeadmutil.CgroupDriverSystemd {
-		err = errors.Errorf("detected %q as the Docker cgroup driver. "+
-			"The recommended driver is %q. "+
-			"Please follow the guide at https://kubernetes.io/docs/setup/cri/",
-			driver,
-			kubeadmutil.CgroupDriverSystemd)
-		return []error{err}, nil
+
+	// Totalram holds the total usable memory. Unit holds the size of a memory unit in bytes. Multiply them and convert to MB
+	actual := uint64(info.Totalram) * uint64(info.Unit) / 1024 / 1024
+	if actual < mc.Mem {
+		errorList = append(errorList, errors.Errorf("the system RAM (%d MB) is less than the minimum %d MB", actual, mc.Mem))
 	}
-	return nil, nil
+	return warnings, errorList
 }

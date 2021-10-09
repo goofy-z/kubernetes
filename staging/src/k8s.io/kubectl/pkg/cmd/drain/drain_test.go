@@ -34,7 +34,6 @@ import (
 	appsv1 "k8s.io/api/apps/v1"
 	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
-	policyv1beta1 "k8s.io/api/policy/v1beta1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
@@ -626,6 +625,16 @@ func TestDrain(t *testing.T) {
 			expected:     cordonedNode,
 			pods:         []corev1.Pod{jobPod},
 			rcs:          []corev1.ReplicationController{rc},
+			args:         []string{"node", "--force", "--delete-emptydir-data=true"},
+			expectFatal:  false,
+			expectDelete: true,
+		},
+		{
+			description:  "Ensure compatibility for --delete-local-data until fully deprecated",
+			node:         node,
+			expected:     cordonedNode,
+			pods:         []corev1.Pod{jobPod},
+			rcs:          []corev1.ReplicationController{rc},
 			args:         []string{"node", "--force", "--delete-local-data=true"},
 			expectFatal:  false,
 			expectDelete: true,
@@ -690,11 +699,11 @@ func TestDrain(t *testing.T) {
 			expectDelete: true,
 		},
 		{
-			description:  "pod with EmptyDir and --delete-local-data",
+			description:  "pod with EmptyDir and --delete-emptydir-data",
 			node:         node,
 			expected:     cordonedNode,
 			pods:         []corev1.Pod{emptydirPod},
-			args:         []string{"node", "--force", "--delete-local-data=true"},
+			args:         []string{"node", "--force", "--delete-emptydir-data=true"},
 			expectFatal:  false,
 			expectDelete: true,
 		},
@@ -757,7 +766,7 @@ func TestDrain(t *testing.T) {
 									{
 										Name: "policy",
 										PreferredVersion: metav1.GroupVersionForDiscovery{
-											GroupVersion: "policy/v1beta1",
+											GroupVersion: "policy/v1",
 										},
 									},
 								},
@@ -770,8 +779,10 @@ func TestDrain(t *testing.T) {
 							if testEviction {
 								resourceList.APIResources = []metav1.APIResource{
 									{
-										Name: drain.EvictionSubresource,
-										Kind: drain.EvictionKind,
+										Name:    drain.EvictionSubresource,
+										Kind:    drain.EvictionKind,
+										Group:   "policy",
+										Version: "v1",
 									},
 								}
 							}
@@ -800,6 +811,7 @@ func TestDrain(t *testing.T) {
 							}
 							getParams := make(url.Values)
 							getParams["fieldSelector"] = []string{"spec.nodeName=node"}
+							getParams["limit"] = []string{"500"}
 							if !reflect.DeepEqual(getParams, values) {
 								t.Fatalf("%s: expected:\n%v\nsaw:\n%v\n", test.description, getParams, values)
 							}
@@ -838,7 +850,7 @@ func TestDrain(t *testing.T) {
 							if test.failUponEvictionOrDeletion {
 								return nil, errors.New("request failed")
 							}
-							return &http.Response{StatusCode: http.StatusCreated, Header: cmdtesting.DefaultHeader(), Body: cmdtesting.ObjBody(codec, &policyv1beta1.Eviction{})}, nil
+							return &http.Response{StatusCode: http.StatusCreated, Header: cmdtesting.DefaultHeader(), Body: cmdtesting.ObjBody(codec, &metav1.Status{})}, nil
 						default:
 							t.Fatalf("%s: unexpected request: %v %#v\n%#v", test.description, req.Method, req.URL, req)
 							return nil, nil

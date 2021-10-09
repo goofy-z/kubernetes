@@ -22,10 +22,12 @@ import (
 	"os"
 	"syscall"
 	"testing"
+
+	netutils "k8s.io/utils/net"
 )
 
 func getIPNet(cidr string) *net.IPNet {
-	_, ipnet, _ := net.ParseCIDR(cidr)
+	_, ipnet, _ := netutils.ParseCIDRSloppy(cidr)
 	return ipnet
 }
 
@@ -35,7 +37,7 @@ func TestIPNetEqual(t *testing.T) {
 		ipnet2 *net.IPNet
 		expect bool
 	}{
-		//null case
+		// null case
 		{
 			getIPNet("10.0.0.1/24"),
 			getIPNet(""),

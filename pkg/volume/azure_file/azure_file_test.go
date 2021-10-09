@@ -1,3 +1,4 @@
+//go:build !providerless
 // +build !providerless
 
 /*
@@ -33,7 +34,7 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/kubernetes/fake"
 	fakecloud "k8s.io/cloud-provider/fake"
-	"k8s.io/utils/mount"
+	"k8s.io/mount-utils"
 
 	"k8s.io/kubernetes/pkg/volume"
 	volumetest "k8s.io/kubernetes/pkg/volume/testing"
@@ -51,7 +52,7 @@ func TestCanSupport(t *testing.T) {
 
 	plug, err := plugMgr.FindPluginByName("kubernetes.io/azure-file")
 	if err != nil {
-		t.Errorf("Can't find the plugin by name")
+		t.Fatal("Can't find the plugin by name")
 	}
 	if plug.GetPluginName() != "kubernetes.io/azure-file" {
 		t.Errorf("Wrong name: %s", plug.GetPluginName())
@@ -371,7 +372,10 @@ func TestAppendDefaultMountOptions(t *testing.T) {
 			fsGroup: nil,
 			expected: []string{"dir_mode=0777",
 				fmt.Sprintf("%s=%s", fileMode, defaultFileMode),
-				fmt.Sprintf("%s=%s", vers, defaultVers)},
+				fmt.Sprintf("%s=%s", vers, defaultVers),
+				fmt.Sprintf("%s=%s", actimeo, defaultActimeo),
+				mfsymlinks,
+			},
 		},
 		{
 			options: []string{"file_mode=0777"},
@@ -379,7 +383,10 @@ func TestAppendDefaultMountOptions(t *testing.T) {
 			expected: []string{"file_mode=0777",
 				fmt.Sprintf("%s=%s", dirMode, defaultDirMode),
 				fmt.Sprintf("%s=%s", vers, defaultVers),
-				fmt.Sprintf("%s=0", gid)},
+				fmt.Sprintf("%s=0", gid),
+				fmt.Sprintf("%s=%s", actimeo, defaultActimeo),
+				mfsymlinks,
+			},
 		},
 		{
 			options: []string{"vers=2.1"},
@@ -387,18 +394,28 @@ func TestAppendDefaultMountOptions(t *testing.T) {
 			expected: []string{"vers=2.1",
 				fmt.Sprintf("%s=%s", fileMode, defaultFileMode),
 				fmt.Sprintf("%s=%s", dirMode, defaultDirMode),
-				fmt.Sprintf("%s=1000", gid)},
+				fmt.Sprintf("%s=1000", gid),
+				fmt.Sprintf("%s=%s", actimeo, defaultActimeo),
+				mfsymlinks,
+			},
 		},
 		{
 			options: []string{""},
 			expected: []string{"", fmt.Sprintf("%s=%s",
 				fileMode, defaultFileMode),
 				fmt.Sprintf("%s=%s", dirMode, defaultDirMode),
-				fmt.Sprintf("%s=%s", vers, defaultVers)},
+				fmt.Sprintf("%s=%s", vers, defaultVers),
+				fmt.Sprintf("%s=%s", actimeo, defaultActimeo),
+				mfsymlinks,
+			},
 		},
 		{
-			options:  []string{"file_mode=0777", "dir_mode=0777"},
-			expected: []string{"file_mode=0777", "dir_mode=0777", fmt.Sprintf("%s=%s", vers, defaultVers)},
+			options: []string{"file_mode=0777", "dir_mode=0777"},
+			expected: []string{"file_mode=0777", "dir_mode=0777",
+				fmt.Sprintf("%s=%s", vers, defaultVers),
+				fmt.Sprintf("%s=%s", actimeo, defaultActimeo),
+				mfsymlinks,
+			},
 		},
 		{
 			options: []string{"gid=2000"},
@@ -406,7 +423,20 @@ func TestAppendDefaultMountOptions(t *testing.T) {
 			expected: []string{"gid=2000",
 				fmt.Sprintf("%s=%s", fileMode, defaultFileMode),
 				fmt.Sprintf("%s=%s", dirMode, defaultDirMode),
-				"vers=3.0"},
+				"vers=3.0",
+				fmt.Sprintf("%s=%s", actimeo, defaultActimeo),
+				mfsymlinks,
+			},
+		},
+		{
+			options: []string{"actimeo=3"},
+			expected: []string{
+				"actimeo=3",
+				fmt.Sprintf("%s=%s", fileMode, defaultFileMode),
+				fmt.Sprintf("%s=%s", dirMode, defaultDirMode),
+				fmt.Sprintf("%s=%s", vers, defaultVers),
+				mfsymlinks,
+			},
 		},
 	}
 

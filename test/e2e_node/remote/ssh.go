@@ -19,6 +19,7 @@ package remote
 import (
 	"flag"
 	"fmt"
+	"os"
 	"os/exec"
 	"os/user"
 	"strings"
@@ -68,6 +69,11 @@ func GetHostnameOrIP(hostname string) string {
 	if ip, found := hostnameIPOverrides.m[hostname]; found {
 		host = ip
 	}
+
+	if *sshUser == "" {
+		*sshUser = os.Getenv("KUBE_SSH_USER")
+	}
+
 	if *sshUser != "" {
 		host = fmt.Sprintf("%s@%s", *sshUser, host)
 	}
@@ -104,8 +110,10 @@ func runSSHCommand(cmd string, args ...string) (string, error) {
 	if *sshOptions != "" {
 		args = append(strings.Split(*sshOptions, " "), args...)
 	}
+	klog.Infof("Running the command %s, with args: %v", cmd, args)
 	output, err := exec.Command(cmd, args...).CombinedOutput()
 	if err != nil {
+		klog.Errorf("failed to run SSH command: out: %s, err: %v", output, err)
 		return string(output), fmt.Errorf("command [%s %s] failed with error: %v", cmd, strings.Join(args, " "), err)
 	}
 	return string(output), nil

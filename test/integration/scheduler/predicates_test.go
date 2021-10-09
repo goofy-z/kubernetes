@@ -24,13 +24,14 @@ import (
 
 	v1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
-	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/util/wait"
+	utilfeature "k8s.io/apiserver/pkg/util/feature"
 	"k8s.io/client-go/kubernetes"
+	featuregatetesting "k8s.io/component-base/featuregate/testing"
+	"k8s.io/kubernetes/pkg/features"
 	st "k8s.io/kubernetes/pkg/scheduler/testing"
 	testutils "k8s.io/kubernetes/test/integration/util"
-	"k8s.io/kubernetes/test/utils"
 	imageutils "k8s.io/kubernetes/test/utils/image"
 )
 
@@ -41,37 +42,31 @@ const pollInterval = 100 * time.Millisecond
 // TestInterPodAffinity verifies that scheduler's inter pod affinity and
 // anti-affinity predicate functions works correctly.
 func TestInterPodAffinity(t *testing.T) {
-	testCtx := initTest(t, "inter-pod-affinity")
+	testCtx := initTest(t, "")
 	defer testutils.CleanupTest(t, testCtx)
-	// Add a few nodes.
-	nodes, err := createNodes(testCtx.ClientSet, "testnode", nil, 2)
+
+	// Add a few nodes with labels
+	nodes, err := createAndWaitForNodesInCache(testCtx, "testnode", st.MakeNode().Label("region", "r1").Label("zone", "z11"), 2)
 	if err != nil {
-		t.Fatalf("Cannot create nodes: %v", err)
-	}
-	// Add labels to the nodes.
-	labels1 := map[string]string{
-		"region": "r1",
-		"zone":   "z11",
-	}
-	for _, node := range nodes {
-		// TODO(nodo): Use PodWrapper to directly initialize node with labels.
-		if err = utils.AddLabelsToNode(testCtx.ClientSet, node.Name, labels1); err != nil {
-			t.Fatalf("Cannot add labels to node: %v", err)
-		}
-		if err = waitForNodeLabels(testCtx.ClientSet, node.Name, labels1); err != nil {
-			t.Fatalf("Adding labels to node didn't succeed: %v", err)
-		}
+		t.Fatal(err)
 	}
 
 	cs := testCtx.ClientSet
 	podLabel := map[string]string{"service": "securityscan"}
 	podLabel2 := map[string]string{"security": "S1"}
 
+	if err := createNamespacesWithLabels(cs, []string{"ns1", "ns2"}, map[string]string{"team": "team1"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := createNamespacesWithLabels(cs, []string{"ns3"}, map[string]string{"team": "team2"}); err != nil {
+		t.Fatal(err)
+	}
+	defaultNS := "ns1"
+
 	tests := []struct {
 		name      string
 		pod       *v1.Pod
 		pods      []*v1.Pod
-		node      *v1.Node
 		fits      bool
 		errorType string
 	}{
@@ -103,7 +98,6 @@ func TestInterPodAffinity(t *testing.T) {
 					},
 				},
 			},
-			node:      nodes[0],
 			fits:      false,
 			errorType: "invalidPod",
 		},
@@ -136,7 +130,6 @@ func TestInterPodAffinity(t *testing.T) {
 					},
 				},
 			},
-			node: nodes[0],
 			fits: false,
 		},
 		{
@@ -179,7 +172,6 @@ func TestInterPodAffinity(t *testing.T) {
 				},
 			},
 			},
-			node: nodes[0],
 			fits: true,
 		},
 		{
@@ -217,7 +209,6 @@ func TestInterPodAffinity(t *testing.T) {
 				ObjectMeta: metav1.ObjectMeta{
 					Name:   "fakename2",
 					Labels: podLabel}}},
-			node: nodes[0],
 			fits: true,
 		},
 		{
@@ -255,8 +246,7 @@ func TestInterPodAffinity(t *testing.T) {
 				NodeName:   nodes[0].Name},
 				ObjectMeta: metav1.ObjectMeta{
 					Name:   "fakename2",
-					Labels: podLabel, Namespace: "ns"}}},
-			node: nodes[0],
+					Labels: podLabel, Namespace: "ns2"}}},
 			fits: false,
 		},
 		{
@@ -293,7 +283,6 @@ func TestInterPodAffinity(t *testing.T) {
 				NodeName:   nodes[0].Name}, ObjectMeta: metav1.ObjectMeta{
 				Name:   "fakename2",
 				Labels: podLabel}}},
-			node: nodes[0],
 			fits: false,
 		},
 		{
@@ -347,7 +336,6 @@ func TestInterPodAffinity(t *testing.T) {
 				NodeName:   nodes[0].Name}, ObjectMeta: metav1.ObjectMeta{
 				Name:   "fakename2",
 				Labels: podLabel}}},
-			node: nodes[0],
 			fits: true,
 		},
 		{
@@ -401,7 +389,6 @@ func TestInterPodAffinity(t *testing.T) {
 				NodeName:   nodes[0].Name}, ObjectMeta: metav1.ObjectMeta{
 				Name:   "fakename2",
 				Labels: podLabel}}},
-			node: nodes[0],
 			fits: false,
 		},
 		{
@@ -454,7 +441,6 @@ func TestInterPodAffinity(t *testing.T) {
 				NodeName:   nodes[0].Name}, ObjectMeta: metav1.ObjectMeta{
 				Name:   "fakename2",
 				Labels: podLabel}}},
-			node: nodes[0],
 			fits: true,
 		},
 		{
@@ -531,7 +517,6 @@ func TestInterPodAffinity(t *testing.T) {
 						Labels: podLabel},
 				},
 			},
-			node: nodes[0],
 			fits: true,
 		},
 		{
@@ -584,7 +569,6 @@ func TestInterPodAffinity(t *testing.T) {
 				NodeName:   nodes[0].Name}, ObjectMeta: metav1.ObjectMeta{
 				Name:   "fakename2",
 				Labels: podLabel}}},
-			node: nodes[0],
 			fits: false,
 		},
 		{
@@ -661,7 +645,6 @@ func TestInterPodAffinity(t *testing.T) {
 						Labels: podLabel},
 				},
 			},
-			node: nodes[0],
 			fits: false,
 		},
 		{
@@ -698,7 +681,6 @@ func TestInterPodAffinity(t *testing.T) {
 				NodeName:   "machine2"}, ObjectMeta: metav1.ObjectMeta{
 				Name:   "fakename2",
 				Labels: podLabel}}},
-			node: nodes[0],
 			fits: false,
 		},
 		{
@@ -738,7 +720,6 @@ func TestInterPodAffinity(t *testing.T) {
 						Labels: podLabel},
 				},
 			},
-			node: nodes[0],
 			fits: false,
 		},
 		{
@@ -778,7 +759,6 @@ func TestInterPodAffinity(t *testing.T) {
 						Labels: podLabel},
 				},
 			},
-			node: nodes[0],
 			fits: true,
 		},
 		{
@@ -820,13 +800,10 @@ func TestInterPodAffinity(t *testing.T) {
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
 			for _, pod := range test.pods {
-				var nsName string
-				if pod.Namespace != "" {
-					nsName = pod.Namespace
-				} else {
-					nsName = testCtx.NS.Name
+				if pod.Namespace == "" {
+					pod.Namespace = defaultNS
 				}
-				createdPod, err := cs.CoreV1().Pods(nsName).Create(context.TODO(), pod, metav1.CreateOptions{})
+				createdPod, err := cs.CoreV1().Pods(pod.Namespace).Create(context.TODO(), pod, metav1.CreateOptions{})
 				if err != nil {
 					t.Fatalf("Error while creating pod: %v", err)
 				}
@@ -835,7 +812,11 @@ func TestInterPodAffinity(t *testing.T) {
 					t.Errorf("Error while creating pod: %v", err)
 				}
 			}
-			testPod, err := cs.CoreV1().Pods(testCtx.NS.Name).Create(context.TODO(), test.pod, metav1.CreateOptions{})
+			if test.pod.Namespace == "" {
+				test.pod.Namespace = defaultNS
+			}
+
+			testPod, err := cs.CoreV1().Pods(test.pod.Namespace).Create(context.TODO(), test.pod, metav1.CreateOptions{})
 			if err != nil {
 				if !(test.errorType == "invalidPod" && apierrors.IsInvalid(err)) {
 					t.Fatalf("Error while creating pod: %v", err)
@@ -851,7 +832,7 @@ func TestInterPodAffinity(t *testing.T) {
 				t.Errorf("Error while trying to fit a pod: %v", err)
 			}
 
-			err = cs.CoreV1().Pods(testCtx.NS.Name).Delete(context.TODO(), test.pod.Name, *metav1.NewDeleteOptions(0))
+			err = cs.CoreV1().Pods(test.pod.Namespace).Delete(context.TODO(), test.pod.Name, *metav1.NewDeleteOptions(0))
 			if err != nil {
 				t.Errorf("Error while deleting pod: %v", err)
 			}
@@ -860,20 +841,249 @@ func TestInterPodAffinity(t *testing.T) {
 				t.Errorf("Error while waiting for pod to get deleted: %v", err)
 			}
 			for _, pod := range test.pods {
-				var nsName string
-				if pod.Namespace != "" {
-					nsName = pod.Namespace
-				} else {
-					nsName = testCtx.NS.Name
-				}
-				err = cs.CoreV1().Pods(nsName).Delete(context.TODO(), pod.Name, *metav1.NewDeleteOptions(0))
+				err = cs.CoreV1().Pods(pod.Namespace).Delete(context.TODO(), pod.Name, *metav1.NewDeleteOptions(0))
 				if err != nil {
 					t.Errorf("Error while deleting pod: %v", err)
 				}
-				err = wait.Poll(pollInterval, wait.ForeverTestTimeout, testutils.PodDeleted(cs, nsName, pod.Name))
+				err = wait.Poll(pollInterval, wait.ForeverTestTimeout, testutils.PodDeleted(cs, pod.Namespace, pod.Name))
 				if err != nil {
 					t.Errorf("Error while waiting for pod to get deleted: %v", err)
 				}
+			}
+		})
+	}
+}
+
+// TestInterPodAffinityWithNamespaceSelector verifies that inter pod affinity with NamespaceSelector works as expected.
+// TODO(https://github.com/kubernetes/enhancements/issues/2249): merge with TestInterPodAffinity once NamespaceSelector
+// graduates to GA.
+func TestInterPodAffinityWithNamespaceSelector(t *testing.T) {
+	podLabel := map[string]string{"service": "securityscan"}
+	tests := []struct {
+		name        string
+		pod         *v1.Pod
+		existingPod *v1.Pod
+		fits        bool
+		errorType   string
+		disabled    bool
+	}{
+		{
+			name: "MatchingNamespaces",
+			pod: &v1.Pod{
+				ObjectMeta: metav1.ObjectMeta{
+					Name: "pod-ns-selector",
+				},
+				Spec: v1.PodSpec{
+					Containers: []v1.Container{{Name: "container", Image: imageutils.GetPauseImageName()}},
+					Affinity: &v1.Affinity{
+						PodAffinity: &v1.PodAffinity{
+							RequiredDuringSchedulingIgnoredDuringExecution: []v1.PodAffinityTerm{
+								{
+									LabelSelector: &metav1.LabelSelector{
+										MatchExpressions: []metav1.LabelSelectorRequirement{
+											{
+												Key:      "service",
+												Operator: metav1.LabelSelectorOpIn,
+												Values:   []string{"securityscan"},
+											},
+										},
+									},
+									NamespaceSelector: &metav1.LabelSelector{
+										MatchExpressions: []metav1.LabelSelectorRequirement{
+											{
+												Key:      "team",
+												Operator: metav1.LabelSelectorOpIn,
+												Values:   []string{"team1"},
+											},
+										},
+									},
+									TopologyKey: "region",
+								},
+							},
+						},
+					},
+				},
+			},
+			existingPod: &v1.Pod{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "fakename2",
+					Labels:    podLabel,
+					Namespace: "ns2",
+				},
+				Spec: v1.PodSpec{
+					Containers: []v1.Container{{Name: "container", Image: imageutils.GetPauseImageName()}},
+				},
+			},
+			fits: true,
+		},
+		{
+			name: "Disabled",
+			pod: &v1.Pod{
+				ObjectMeta: metav1.ObjectMeta{
+					Name: "pod-ns-selector",
+				},
+				Spec: v1.PodSpec{
+					Containers: []v1.Container{{Name: "container", Image: imageutils.GetPauseImageName()}},
+					Affinity: &v1.Affinity{
+						PodAffinity: &v1.PodAffinity{
+							RequiredDuringSchedulingIgnoredDuringExecution: []v1.PodAffinityTerm{
+								{
+									LabelSelector: &metav1.LabelSelector{
+										MatchExpressions: []metav1.LabelSelectorRequirement{
+											{
+												Key:      "service",
+												Operator: metav1.LabelSelectorOpIn,
+												Values:   []string{"securityscan"},
+											},
+										},
+									},
+									NamespaceSelector: &metav1.LabelSelector{
+										MatchExpressions: []metav1.LabelSelectorRequirement{
+											{
+												Key:      "team",
+												Operator: metav1.LabelSelectorOpIn,
+												Values:   []string{"team1"},
+											},
+										},
+									},
+									TopologyKey: "region",
+								},
+							},
+						},
+					},
+				},
+			},
+			existingPod: &v1.Pod{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "fakename2",
+					Labels:    podLabel,
+					Namespace: "ns2",
+				},
+				Spec: v1.PodSpec{
+					Containers: []v1.Container{{Name: "container", Image: imageutils.GetPauseImageName()}},
+				},
+			},
+			fits:     false,
+			disabled: true,
+		},
+		{
+			name: "MismatchingNamespaces",
+			pod: &v1.Pod{
+				ObjectMeta: metav1.ObjectMeta{
+					Name: "pod-ns-selector",
+				},
+				Spec: v1.PodSpec{
+					Containers: []v1.Container{{Name: "container", Image: imageutils.GetPauseImageName()}},
+					Affinity: &v1.Affinity{
+						PodAffinity: &v1.PodAffinity{
+							RequiredDuringSchedulingIgnoredDuringExecution: []v1.PodAffinityTerm{
+								{
+									LabelSelector: &metav1.LabelSelector{
+										MatchExpressions: []metav1.LabelSelectorRequirement{
+											{
+												Key:      "service",
+												Operator: metav1.LabelSelectorOpIn,
+												Values:   []string{"securityscan"},
+											},
+										},
+									},
+									NamespaceSelector: &metav1.LabelSelector{
+										MatchExpressions: []metav1.LabelSelectorRequirement{
+											{
+												Key:      "team",
+												Operator: metav1.LabelSelectorOpIn,
+												Values:   []string{"team1"},
+											},
+										},
+									},
+									TopologyKey: "region",
+								},
+							},
+						},
+					},
+				},
+			},
+			existingPod: &v1.Pod{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "fakename2",
+					Labels:    podLabel,
+					Namespace: "ns3",
+				},
+				Spec: v1.PodSpec{
+					Containers: []v1.Container{{Name: "container", Image: imageutils.GetPauseImageName()}},
+				},
+			},
+			fits: false,
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			defer featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, features.PodAffinityNamespaceSelector, !test.disabled)()
+			testCtx := initTest(t, "")
+			defer testutils.CleanupTest(t, testCtx)
+
+			// Add a few nodes with labels
+			nodes, err := createAndWaitForNodesInCache(testCtx, "testnode", st.MakeNode().Label("region", "r1").Label("zone", "z11"), 2)
+			if err != nil {
+				t.Fatal(err)
+			}
+			test.existingPod.Spec.NodeName = nodes[0].Name
+
+			cs := testCtx.ClientSet
+
+			if err := createNamespacesWithLabels(cs, []string{"ns1", "ns2"}, map[string]string{"team": "team1"}); err != nil {
+				t.Fatal(err)
+			}
+			if err := createNamespacesWithLabels(cs, []string{"ns3"}, map[string]string{"team": "team2"}); err != nil {
+				t.Fatal(err)
+			}
+			defaultNS := "ns1"
+
+			createdPod, err := cs.CoreV1().Pods(test.existingPod.Namespace).Create(context.TODO(), test.existingPod, metav1.CreateOptions{})
+			if err != nil {
+				t.Fatalf("Error while creating pod: %v", err)
+			}
+			err = wait.Poll(pollInterval, wait.ForeverTestTimeout, testutils.PodScheduled(cs, createdPod.Namespace, createdPod.Name))
+			if err != nil {
+				t.Errorf("Error while creating pod: %v", err)
+			}
+
+			if test.pod.Namespace == "" {
+				test.pod.Namespace = defaultNS
+			}
+
+			testPod, err := cs.CoreV1().Pods(test.pod.Namespace).Create(context.TODO(), test.pod, metav1.CreateOptions{})
+			if err != nil {
+				if !(test.errorType == "invalidPod" && apierrors.IsInvalid(err)) {
+					t.Fatalf("Error while creating pod: %v", err)
+				}
+			}
+
+			if test.fits {
+				err = wait.Poll(pollInterval, wait.ForeverTestTimeout, testutils.PodScheduled(cs, testPod.Namespace, testPod.Name))
+			} else {
+				err = wait.Poll(pollInterval, wait.ForeverTestTimeout, podUnschedulable(cs, testPod.Namespace, testPod.Name))
+			}
+			if err != nil {
+				t.Errorf("Error while trying to fit a pod: %v", err)
+			}
+
+			err = cs.CoreV1().Pods(test.pod.Namespace).Delete(context.TODO(), test.pod.Name, *metav1.NewDeleteOptions(0))
+			if err != nil {
+				t.Errorf("Error while deleting pod: %v", err)
+			}
+			err = wait.Poll(pollInterval, wait.ForeverTestTimeout, testutils.PodDeleted(cs, testCtx.NS.Name, test.pod.Name))
+			if err != nil {
+				t.Errorf("Error while waiting for pod to get deleted: %v", err)
+			}
+			err = cs.CoreV1().Pods(test.existingPod.Namespace).Delete(context.TODO(), test.existingPod.Name, *metav1.NewDeleteOptions(0))
+			if err != nil {
+				t.Errorf("Error while deleting pod: %v", err)
+			}
+			err = wait.Poll(pollInterval, wait.ForeverTestTimeout, testutils.PodDeleted(cs, test.existingPod.Namespace, test.existingPod.Name))
+			if err != nil {
+				t.Errorf("Error while waiting for pod to get deleted: %v", err)
 			}
 		})
 	}
@@ -885,23 +1095,14 @@ func TestEvenPodsSpreadPredicate(t *testing.T) {
 	cs := testCtx.ClientSet
 	ns := testCtx.NS.Name
 	defer testutils.CleanupTest(t, testCtx)
-	// Add 4 nodes.
-	nodes, err := createNodes(cs, "node", nil, 4)
-	if err != nil {
-		t.Fatalf("Cannot create nodes: %v", err)
-	}
-	for i, node := range nodes {
-		// Apply labels "zone: zone-{0,1}" and "node: <node name>" to each node.
-		labels := map[string]string{
-			"zone": fmt.Sprintf("zone-%d", i/2),
-			"node": node.Name,
-		}
-		// TODO(nodo): Use PodWrapper to directly initialize node with labels.
-		if err = utils.AddLabelsToNode(cs, node.Name, labels); err != nil {
-			t.Fatalf("Cannot add labels to node: %v", err)
-		}
-		if err = waitForNodeLabels(cs, node.Name, labels); err != nil {
-			t.Fatalf("Failed to poll node labels: %v", err)
+
+	for i := 0; i < 4; i++ {
+		// Create nodes with labels "zone: zone-{0,1}" and "node: <node name>" to each node.
+		nodeName := fmt.Sprintf("node-%d", i)
+		zone := fmt.Sprintf("zone-%d", i/2)
+		_, err := createNode(cs, st.MakeNode().Name(nodeName).Label("node", nodeName).Label("zone", zone).Obj())
+		if err != nil {
+			t.Fatalf("Cannot create node: %v", err)
 		}
 	}
 
@@ -1051,7 +1252,7 @@ func TestUnschedulablePodBecomesSchedulable(t *testing.T) {
 				Name: "pod-1",
 			},
 			update: func(cs kubernetes.Interface, _ string) error {
-				_, err := createNode(cs, "node-added", nil)
+				_, err := createNode(cs, st.MakeNode().Name("node-added").Obj())
 				if err != nil {
 					return fmt.Errorf("cannot create node: %v", err)
 				}
@@ -1061,7 +1262,7 @@ func TestUnschedulablePodBecomesSchedulable(t *testing.T) {
 		{
 			name: "node gets taint removed",
 			init: func(cs kubernetes.Interface, _ string) error {
-				node, err := createNode(cs, "node-tainted", nil)
+				node, err := createNode(cs, st.MakeNode().Name("node-tainted").Obj())
 				if err != nil {
 					return fmt.Errorf("cannot create node: %v", err)
 				}
@@ -1085,10 +1286,8 @@ func TestUnschedulablePodBecomesSchedulable(t *testing.T) {
 		{
 			name: "other pod gets deleted",
 			init: func(cs kubernetes.Interface, ns string) error {
-				nodeResources := &v1.ResourceList{
-					v1.ResourcePods: *resource.NewQuantity(1, resource.DecimalSI),
-				}
-				_, err := createNode(cs, "node-scheduler-integration-test", nodeResources)
+				nodeObject := st.MakeNode().Name("node-scheduler-integration-test").Capacity(map[v1.ResourceName]string{v1.ResourcePods: "1"}).Obj()
+				_, err := createNode(cs, nodeObject)
 				if err != nil {
 					return fmt.Errorf("cannot create node: %v", err)
 				}
@@ -1111,13 +1310,9 @@ func TestUnschedulablePodBecomesSchedulable(t *testing.T) {
 		{
 			name: "pod with pod-affinity gets added",
 			init: func(cs kubernetes.Interface, _ string) error {
-				node, err := createNode(cs, "node-1", nil)
+				_, err := createNode(cs, st.MakeNode().Name("node-1").Label("region", "test").Obj())
 				if err != nil {
 					return fmt.Errorf("cannot create node: %v", err)
-				}
-				// TODO(nodo): Use PodWrapper to directly initialize node with labels.
-				if err := utils.AddLabelsToNode(cs, node.Name, map[string]string{"region": "test"}); err != nil {
-					return fmt.Errorf("cannot add labels to node: %v", err)
 				}
 				return nil
 			},
@@ -1155,13 +1350,9 @@ func TestUnschedulablePodBecomesSchedulable(t *testing.T) {
 		{
 			name: "scheduled pod gets updated to match affinity",
 			init: func(cs kubernetes.Interface, ns string) error {
-				node, err := createNode(cs, "node-1", nil)
+				_, err := createNode(cs, st.MakeNode().Name("node-1").Label("region", "test").Obj())
 				if err != nil {
 					return fmt.Errorf("cannot create node: %v", err)
-				}
-				// TODO(nodo): Use PodWrapper to directly initialize node with labels.
-				if err := utils.AddLabelsToNode(cs, node.Name, map[string]string{"region": "test"}); err != nil {
-					return fmt.Errorf("cannot add labels to node: %v", err)
 				}
 				if _, err := createPausePod(cs, initPausePod(&pausePodConfig{Name: "pod-to-be-updated", Namespace: ns})); err != nil {
 					return fmt.Errorf("cannot create pod: %v", err)

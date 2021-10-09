@@ -27,10 +27,7 @@ source "${KUBE_ROOT}/hack/lib/init.sh"
 # $1: Full path to the directory where the api.proto file is
 function kube::protoc::generate_proto() {
   kube::golang::setup_env
-  local bins=(
-    vendor/k8s.io/code-generator/cmd/go-to-protobuf/protoc-gen-gogo
-  )
-  make -C "${KUBE_ROOT}" WHAT="${bins[*]}"
+  go install k8s.io/kubernetes/vendor/k8s.io/code-generator/cmd/go-to-protobuf/protoc-gen-gogo
 
   kube::protoc::check_protoc
 
@@ -46,7 +43,7 @@ function kube::protoc::check_protoc() {
     echo "Generating protobuf requires protoc 3.0.0-beta1 or newer. Please download and"
     echo "install the platform appropriate Protobuf package for your OS: "
     echo
-    echo "  https://github.com/google/protobuf/releases"
+    echo "  https://github.com/protocolbuffers/protobuf/releases"
     echo
     echo "WARNING: Protobuf changes are not being validated"
     exit 1

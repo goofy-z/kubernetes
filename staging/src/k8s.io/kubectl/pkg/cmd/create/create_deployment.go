@@ -43,16 +43,16 @@ var (
 	Create a deployment with the specified name.`))
 
 	deploymentExample = templates.Examples(i18n.T(`
-	# Create a deployment named my-dep that runs the busybox image.
+	# Create a deployment named my-dep that runs the busybox image
 	kubectl create deployment my-dep --image=busybox
 
-	# Create a deployment with command
+	# Create a deployment with a command
 	kubectl create deployment my-dep --image=busybox -- date
 
-	# Create a deployment named my-dep that runs the nginx image with 3 replicas.
+	# Create a deployment named my-dep that runs the nginx image with 3 replicas
 	kubectl create deployment my-dep --image=nginx --replicas=3
 
-	# Create a deployment named my-dep that runs the busybox image and expose port 5701.
+	# Create a deployment named my-dep that runs the busybox image and expose port 5701
 	kubectl create deployment my-dep --image=busybox --port=5701`))
 )
 
@@ -79,7 +79,8 @@ type CreateDeploymentOptions struct {
 	genericclioptions.IOStreams
 }
 
-func NewCreateCreateDeploymentOptions(ioStreams genericclioptions.IOStreams) *CreateDeploymentOptions {
+// NewCreateDeploymentOptions returns an initialized CreateDeploymentOptions instance
+func NewCreateDeploymentOptions(ioStreams genericclioptions.IOStreams) *CreateDeploymentOptions {
 	return &CreateDeploymentOptions{
 		Port:       -1,
 		Replicas:   1,
@@ -91,12 +92,12 @@ func NewCreateCreateDeploymentOptions(ioStreams genericclioptions.IOStreams) *Cr
 // NewCmdCreateDeployment is a macro command to create a new deployment.
 // This command is better known to users as `kubectl create deployment`.
 func NewCmdCreateDeployment(f cmdutil.Factory, ioStreams genericclioptions.IOStreams) *cobra.Command {
-	o := NewCreateCreateDeploymentOptions(ioStreams)
+	o := NewCreateDeploymentOptions(ioStreams)
 	cmd := &cobra.Command{
 		Use:                   "deployment NAME --image=image -- [COMMAND] [args...]",
 		DisableFlagsInUseLine: true,
 		Aliases:               []string{"deploy"},
-		Short:                 deploymentLong,
+		Short:                 i18n.T("Create a deployment with the specified name"),
 		Long:                  deploymentLong,
 		Example:               deploymentExample,
 		Run: func(cmd *cobra.Command, args []string) {
@@ -110,7 +111,7 @@ func NewCmdCreateDeployment(f cmdutil.Factory, ioStreams genericclioptions.IOStr
 
 	cmdutil.AddApplyAnnotationFlags(cmd)
 	cmdutil.AddValidateFlags(cmd)
-	cmdutil.AddGeneratorFlags(cmd, "")
+	cmdutil.AddDryRunFlag(cmd)
 	cmd.Flags().StringSliceVar(&o.Images, "image", o.Images, "Image names to run.")
 	cmd.MarkFlagRequired("image")
 	cmd.Flags().Int32Var(&o.Port, "port", o.Port, "The port that this container exposes.")
@@ -155,11 +156,7 @@ func (o *CreateDeploymentOptions) Complete(f cmdutil.Factory, cmd *cobra.Command
 	if err != nil {
 		return err
 	}
-	discoveryClient, err := f.ToDiscoveryClient()
-	if err != nil {
-		return err
-	}
-	o.DryRunVerifier = resource.NewDryRunVerifier(dynamicClient, discoveryClient)
+	o.DryRunVerifier = resource.NewDryRunVerifier(dynamicClient, f.OpenAPIGetter())
 	cmdutil.PrintFlagsWithDryRunStrategy(o.PrintFlags, o.DryRunStrategy)
 
 	printer, err := o.PrintFlags.ToPrinter()
@@ -173,6 +170,7 @@ func (o *CreateDeploymentOptions) Complete(f cmdutil.Factory, cmd *cobra.Command
 	return nil
 }
 
+// Validate makes sure there is no discrepency in provided option values
 func (o *CreateDeploymentOptions) Validate() error {
 	if len(o.Images) > 1 && len(o.Command) > 0 {
 		return fmt.Errorf("cannot specify multiple --image options and command")

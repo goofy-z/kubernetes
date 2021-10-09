@@ -17,8 +17,11 @@ limitations under the License.
 package apiresources
 
 import (
+	"bytes"
 	"fmt"
 	"io"
+	"io/ioutil"
+	"os"
 	"sort"
 	"strings"
 
@@ -31,18 +34,19 @@ import (
 	"k8s.io/cli-runtime/pkg/genericclioptions"
 	"k8s.io/cli-runtime/pkg/printers"
 	cmdutil "k8s.io/kubectl/pkg/cmd/util"
+	"k8s.io/kubectl/pkg/util/i18n"
 	"k8s.io/kubectl/pkg/util/templates"
 )
 
 var (
 	apiresourcesExample = templates.Examples(`
-		# Print the supported API Resources
+		# Print the supported API resources
 		kubectl api-resources
 
-		# Print the supported API Resources with more information
+		# Print the supported API resources with more information
 		kubectl api-resources -o wide
 
-		# Print the supported API Resources sorted by a column
+		# Print the supported API resources sorted by a column
 		kubectl api-resources --sort-by=name
 
 		# Print the supported namespaced resources
@@ -51,7 +55,7 @@ var (
 		# Print the supported non-namespaced resources
 		kubectl api-resources --namespaced=false
 
-		# Print the supported API Resources with specific APIGroup
+		# Print the supported API resources with a specific APIGroup
 		kubectl api-resources --api-group=extensions`)
 )
 
@@ -71,8 +75,9 @@ type APIResourceOptions struct {
 
 // groupResource contains the APIGroup and APIResource
 type groupResource struct {
-	APIGroup    string
-	APIResource metav1.APIResource
+	APIGroup        string
+	APIGroupVersion string
+	APIResource     metav1.APIResource
 }
 
 // NewAPIResourceOptions creates the options for APIResource
@@ -89,8 +94,8 @@ func NewCmdAPIResources(f cmdutil.Factory, ioStreams genericclioptions.IOStreams
 
 	cmd := &cobra.Command{
 		Use:     "api-resources",
-		Short:   "Print the supported API resources on the server",
-		Long:    "Print the supported API resources on the server",
+		Short:   i18n.T("Print the supported API resources on the server"),
+		Long:    i18n.T("Print the supported API resources on the server."),
 		Example: apiresourcesExample,
 		Run: func(cmd *cobra.Command, args []string) {
 			cmdutil.CheckErr(o.Complete(cmd, args))
@@ -184,8 +189,9 @@ func (o *APIResourceOptions) RunAPIResources(cmd *cobra.Command, f cmdutil.Facto
 				continue
 			}
 			resources = append(resources, groupResource{
-				APIGroup:    gv.Group,
-				APIResource: resource,
+				APIGroup:        gv.Group,
+				APIGroupVersion: gv.String(),
+				APIResource:     resource,
 			})
 		}
 	}
@@ -211,7 +217,7 @@ func (o *APIResourceOptions) RunAPIResources(cmd *cobra.Command, f cmdutil.Facto
 			if _, err := fmt.Fprintf(w, "%s\t%s\t%s\t%v\t%s\t%v\n",
 				r.APIResource.Name,
 				strings.Join(r.APIResource.ShortNames, ","),
-				r.APIGroup,
+				r.APIGroupVersion,
 				r.APIResource.Namespaced,
 				r.APIResource.Kind,
 				r.APIResource.Verbs); err != nil {
@@ -221,7 +227,7 @@ func (o *APIResourceOptions) RunAPIResources(cmd *cobra.Command, f cmdutil.Facto
 			if _, err := fmt.Fprintf(w, "%s\t%s\t%s\t%v\t%s\n",
 				r.APIResource.Name,
 				strings.Join(r.APIResource.ShortNames, ","),
-				r.APIGroup,
+				r.APIGroupVersion,
 				r.APIResource.Namespaced,
 				r.APIResource.Kind); err != nil {
 				errs = append(errs, err)
@@ -236,7 +242,7 @@ func (o *APIResourceOptions) RunAPIResources(cmd *cobra.Command, f cmdutil.Facto
 }
 
 func printContextHeaders(out io.Writer, output string) error {
-	columnNames := []string{"NAME", "SHORTNAMES", "APIGROUP", "NAMESPACED", "KIND"}
+	columnNames := []string{"NAME", "SHORTNAMES", "APIVERSION", "NAMESPACED", "KIND"}
 	if output == "wide" {
 		columnNames = append(columnNames, "VERBS")
 	}
@@ -271,4 +277,39 @@ func (s sortableResource) compareValues(i, j int) (string, string) {
 		return s.resources[i].APIResource.Kind, s.resources[j].APIResource.Kind
 	}
 	return s.resources[i].APIGroup, s.resources[j].APIGroup
+}
+
+// CompGetResourceList returns the list of api resources which begin with `toComplete`.
+func CompGetResourceList(f cmdutil.Factory, cmd *cobra.Command, toComplete string) []string {
+	buf := new(bytes.Buffer)
+	streams := genericclioptions.IOStreams{In: os.Stdin, Out: buf, ErrOut: ioutil.Discard}
+	o := NewAPIResourceOptions(streams)
+
+	// Get the list of resources
+	o.Output = "name"
+	o.Cached = true
+	o.Verbs = []string{"get"}
+	// TODO:Should set --request-timeout=5s
+
+	// Ignore errors as the output may still be valid
+	o.RunAPIResources(cmd, f)
+
+	// Resources can be a comma-separated list.  The last element is then
+	// the one we should complete.  For example if toComplete=="pods,secre"
+	// we should return "pods,secrets"
+	prefix := ""
+	suffix := toComplete
+	lastIdx := strings.LastIndex(toComplete, ",")
+	if lastIdx != -1 {
+		prefix = toComplete[0 : lastIdx+1]
+		suffix = toComplete[lastIdx+1:]
+	}
+	var comps []string
+	resources := strings.Split(buf.String(), "\n")
+	for _, res := range resources {
+		if res != "" && strings.HasPrefix(res, suffix) {
+			comps = append(comps, fmt.Sprintf("%s%s", prefix, res))
+		}
+	}
+	return comps
 }

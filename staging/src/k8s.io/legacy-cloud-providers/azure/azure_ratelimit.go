@@ -1,3 +1,4 @@
+//go:build !providerless
 // +build !providerless
 
 /*
@@ -56,7 +57,7 @@ func InitializeCloudProviderRateLimitConfig(config *CloudProviderRateLimitConfig
 	if config.CloudProviderRateLimitBucket == 0 {
 		config.CloudProviderRateLimitBucket = rateLimitBucketDefault
 	}
-	// Assing write rate limit defaults if no configuration was passed in.
+	// Assign write rate limit defaults if no configuration was passed in.
 	if config.CloudProviderRateLimitQPSWrite == 0 {
 		config.CloudProviderRateLimitQPSWrite = config.CloudProviderRateLimitQPS
 	}

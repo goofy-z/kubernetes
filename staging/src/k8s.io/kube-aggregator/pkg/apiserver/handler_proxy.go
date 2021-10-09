@@ -26,15 +26,16 @@ import (
 
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/util/httpstream"
-	"k8s.io/apimachinery/pkg/util/httpstream/spdy"
 	utilnet "k8s.io/apimachinery/pkg/util/net"
 	"k8s.io/apimachinery/pkg/util/proxy"
+	auditinternal "k8s.io/apiserver/pkg/apis/audit"
 	"k8s.io/apiserver/pkg/endpoints/handlers/responsewriters"
 	endpointmetrics "k8s.io/apiserver/pkg/endpoints/metrics"
 	genericapirequest "k8s.io/apiserver/pkg/endpoints/request"
 	genericfeatures "k8s.io/apiserver/pkg/features"
 	"k8s.io/apiserver/pkg/server/egressselector"
 	utilfeature "k8s.io/apiserver/pkg/util/feature"
+	"k8s.io/apiserver/pkg/util/x509metrics"
 	restclient "k8s.io/client-go/rest"
 	"k8s.io/client-go/transport"
 	"k8s.io/klog/v2"
@@ -48,17 +49,17 @@ const (
 	aggregatedDiscoveryTimeout = 5 * time.Second
 )
 
+type certKeyFunc func() ([]byte, []byte)
+
 // proxyHandler provides a http.Handler which will proxy traffic to locations
 // specified by items implementing Redirector.
 type proxyHandler struct {
 	// localDelegate is used to satisfy local APIServices
 	localDelegate http.Handler
 
-	// proxyClientCert/Key are the client cert used to identify this proxy. Backing APIServices use
-	// this to confirm the proxy's identity
-	proxyClientCert []byte
-	proxyClientKey  []byte
-	proxyTransport  *http.Transport
+	// proxyCurrentCertKeyContent holds the client cert used to identify this proxy. Backing APIServices use this to confirm the proxy's identity
+	proxyCurrentCertKeyContent certKeyFunc
+	proxyTransport             *http.Transport
 
 	// Endpoints based routing to map from cluster IP to routable IP
 	serviceResolver ServiceResolver
@@ -159,12 +160,9 @@ func (r *proxyHandler) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 		return
 	}
 
-	// we need to wrap the roundtripper in another roundtripper which will apply the front proxy headers
-	proxyRoundTripper, upgrade, err := maybeWrapForConnectionUpgrades(handlingInfo.restConfig, handlingInfo.proxyRoundTripper, req)
-	if err != nil {
-		proxyError(w, req, err.Error(), http.StatusInternalServerError)
-		return
-	}
+	proxyRoundTripper := handlingInfo.proxyRoundTripper
+	upgrade := httpstream.IsUpgradeRequest(req)
+
 	proxyRoundTripper = transport.NewAuthProxyRoundTripper(user.GetName(), user.GetGroups(), user.GetExtra(), proxyRoundTripper)
 
 	// if we are upgrading, then the upgrade path tries to use this request with the TLS config we provide, but it does
@@ -176,6 +174,8 @@ func (r *proxyHandler) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 	}
 
 	handler := proxy.NewUpgradeAwareHandler(location, proxyRoundTripper, true, upgrade, &responder{w: w})
+	handler.InterceptRedirects = utilfeature.DefaultFeatureGate.Enabled(genericfeatures.StreamingProxyRedirects)
+	handler.RequireSameHostRedirects = utilfeature.DefaultFeatureGate.Enabled(genericfeatures.ValidateProxyRedirects)
 	handler.ServeHTTP(w, newReq)
 }
 
@@ -201,28 +201,13 @@ func newRequestForProxy(location *url.URL, req *http.Request) (*http.Request, co
 	newReq.URL = location
 	newReq.Host = location.Host
 
+	// If the original request has an audit ID, let's make sure we propagate this
+	// to the aggregated server.
+	if auditID, found := genericapirequest.AuditIDFrom(req.Context()); found {
+		newReq.Header.Set(auditinternal.HeaderAuditID, string(auditID))
+	}
+
 	return newReq, cancelFn
-}
-
-// maybeWrapForConnectionUpgrades wraps the roundtripper for upgrades.  The bool indicates if it was wrapped
-func maybeWrapForConnectionUpgrades(restConfig *restclient.Config, rt http.RoundTripper, req *http.Request) (http.RoundTripper, bool, error) {
-	if !httpstream.IsUpgradeRequest(req) {
-		return rt, false, nil
-	}
-
-	tlsConfig, err := restclient.TLSConfigFor(restConfig)
-	if err != nil {
-		return nil, true, err
-	}
-	followRedirects := utilfeature.DefaultFeatureGate.Enabled(genericfeatures.StreamingProxyRedirects)
-	requireSameHostRedirects := utilfeature.DefaultFeatureGate.Enabled(genericfeatures.ValidateProxyRedirects)
-	upgradeRoundTripper := spdy.NewRoundTripper(tlsConfig, followRedirects, requireSameHostRedirects)
-	wrappedRT, err := restclient.HTTPWrappersForConfig(restConfig, upgradeRoundTripper)
-	if err != nil {
-		return nil, true, err
-	}
-
-	return wrappedRT, true, nil
 }
 
 // responder implements rest.Responder for assisting a connector in writing objects or errors.
@@ -237,7 +222,7 @@ func (r *responder) Object(statusCode int, obj runtime.Object) {
 }
 
 func (r *responder) Error(_ http.ResponseWriter, _ *http.Request, err error) {
-	http.Error(r.w, err.Error(), http.StatusInternalServerError)
+	http.Error(r.w, err.Error(), http.StatusServiceUnavailable)
 }
 
 // these methods provide locked access to fields
@@ -248,17 +233,22 @@ func (r *proxyHandler) updateAPIService(apiService *apiregistrationv1api.APIServ
 		return
 	}
 
-	newInfo := proxyHandlingInfo{
-		name: apiService.Name,
-		restConfig: &restclient.Config{
-			TLSClientConfig: restclient.TLSClientConfig{
-				Insecure:   apiService.Spec.InsecureSkipTLSVerify,
-				ServerName: apiService.Spec.Service.Name + "." + apiService.Spec.Service.Namespace + ".svc",
-				CertData:   r.proxyClientCert,
-				KeyData:    r.proxyClientKey,
-				CAData:     apiService.Spec.CABundle,
-			},
+	proxyClientCert, proxyClientKey := r.proxyCurrentCertKeyContent()
+
+	clientConfig := &restclient.Config{
+		TLSClientConfig: restclient.TLSClientConfig{
+			Insecure:   apiService.Spec.InsecureSkipTLSVerify,
+			ServerName: apiService.Spec.Service.Name + "." + apiService.Spec.Service.Namespace + ".svc",
+			CertData:   proxyClientCert,
+			KeyData:    proxyClientKey,
+			CAData:     apiService.Spec.CABundle,
 		},
+	}
+	clientConfig.Wrap(x509metrics.NewMissingSANRoundTripperWrapperConstructor(x509MissingSANCounter))
+
+	newInfo := proxyHandlingInfo{
+		name:             apiService.Name,
+		restConfig:       clientConfig,
 		serviceName:      apiService.Spec.Service.Name,
 		serviceNamespace: apiService.Spec.Service.Namespace,
 		servicePort:      *apiService.Spec.Service.Port,

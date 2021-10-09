@@ -1,3 +1,4 @@
+//go:build !providerless
 // +build !providerless
 
 /*
@@ -85,12 +86,8 @@ func (ss *scaleSet) AttachDisk(isManagedDisk bool, diskName, diskURI string, nod
 			})
 	}
 	newVM := compute.VirtualMachineScaleSetVM{
-		Sku:      vm.Sku,
-		Location: vm.Location,
 		VirtualMachineScaleSetVMProperties: &compute.VirtualMachineScaleSetVMProperties{
-			HardwareProfile: vm.HardwareProfile,
 			StorageProfile: &compute.StorageProfile{
-				OsDisk:    vm.StorageProfile.OsDisk,
 				DataDisks: &disks,
 			},
 		},
@@ -147,7 +144,11 @@ func (ss *scaleSet) DetachDisk(diskName, diskURI string, nodeName types.NodeName
 			(disk.ManagedDisk != nil && diskURI != "" && strings.EqualFold(*disk.ManagedDisk.ID, diskURI)) {
 			// found the disk
 			klog.V(2).Infof("azureDisk - detach disk: name %q uri %q", diskName, diskURI)
-			disks[i].ToBeDetached = to.BoolPtr(true)
+			if strings.EqualFold(ss.cloud.Environment.Name, AzureStackCloudName) {
+				disks = append(disks[:i], disks[i+1:]...)
+			} else {
+				disks[i].ToBeDetached = to.BoolPtr(true)
+			}
 			bFoundDisk = true
 			break
 		}
@@ -159,12 +160,8 @@ func (ss *scaleSet) DetachDisk(diskName, diskURI string, nodeName types.NodeName
 	}
 
 	newVM := compute.VirtualMachineScaleSetVM{
-		Sku:      vm.Sku,
-		Location: vm.Location,
 		VirtualMachineScaleSetVMProperties: &compute.VirtualMachineScaleSetVMProperties{
-			HardwareProfile: vm.HardwareProfile,
 			StorageProfile: &compute.StorageProfile{
-				OsDisk:    vm.StorageProfile.OsDisk,
 				DataDisks: &disks,
 			},
 		},

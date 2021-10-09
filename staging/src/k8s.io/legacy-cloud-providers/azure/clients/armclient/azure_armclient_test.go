@@ -1,3 +1,4 @@
+//go:build !providerless
 // +build !providerless
 
 /*
@@ -35,6 +36,22 @@ import (
 const (
 	testResourceID = "/subscriptions/subscription/resourceGroups/rg/providers/Microsoft.Network/publicIPAddresses/testPIP"
 )
+
+func TestNew(t *testing.T) {
+	backoff := &retry.Backoff{Steps: 3}
+	armClient := New(nil, "", "test", "2019-01-01", "eastus", backoff)
+	assert.NotNil(t, armClient.backoff)
+	assert.Equal(t, 3, armClient.backoff.Steps, "Backoff steps should be same as the value passed in")
+
+	backoff = &retry.Backoff{Steps: 0}
+	armClient = New(nil, "", "test", "2019-01-01", "eastus", backoff)
+	assert.NotNil(t, armClient.backoff)
+	assert.Equal(t, 1, armClient.backoff.Steps, "Backoff steps should be default to 1 if it is 0")
+
+	armClient = New(nil, "", "test", "2019-01-01", "eastus", nil)
+	assert.NotNil(t, armClient.backoff)
+	assert.Equal(t, 1, armClient.backoff.Steps, "Backoff steps should be default to 1 if it is not set")
+}
 
 func TestSend(t *testing.T) {
 	count := 0

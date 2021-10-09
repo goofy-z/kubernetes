@@ -49,7 +49,7 @@ import (
 	"k8s.io/klog/v2"
 	"k8s.io/kubernetes/pkg/api/legacyscheme"
 	rbachelper "k8s.io/kubernetes/pkg/apis/rbac/v1"
-	"k8s.io/kubernetes/pkg/master"
+	"k8s.io/kubernetes/pkg/controlplane"
 	"k8s.io/kubernetes/pkg/registry/rbac/clusterrole"
 	clusterrolestore "k8s.io/kubernetes/pkg/registry/rbac/clusterrole/storage"
 	"k8s.io/kubernetes/pkg/registry/rbac/clusterrolebinding"
@@ -78,7 +78,7 @@ func clientsetForToken(user string, config *restclient.Config) (clientset.Interf
 }
 
 type testRESTOptionsGetter struct {
-	config *master.Config
+	config *controlplane.Config
 }
 
 func (getter *testRESTOptionsGetter) GetRESTOptions(resource schema.GroupResource) (generic.RESTOptions, error) {
@@ -89,7 +89,7 @@ func (getter *testRESTOptionsGetter) GetRESTOptions(resource schema.GroupResourc
 	return generic.RESTOptions{StorageConfig: storageConfig, Decorator: generic.UndecoratedStorage, ResourcePrefix: resource.Resource}, nil
 }
 
-func newRBACAuthorizer(t *testing.T, config *master.Config) authorizer.Authorizer {
+func newRBACAuthorizer(t *testing.T, config *controlplane.Config) authorizer.Authorizer {
 	optsGetter := &testRESTOptionsGetter{config}
 	roleRest, err := rolestore.NewREST(optsGetter)
 	if err != nil {
@@ -519,9 +519,9 @@ func TestRBAC(t *testing.T) {
 
 	for i, tc := range tests {
 		// Create an API Server.
-		masterConfig := framework.NewIntegrationTestMasterConfig()
-		masterConfig.GenericConfig.Authorization.Authorizer = newRBACAuthorizer(t, masterConfig)
-		masterConfig.GenericConfig.Authentication.Authenticator = bearertoken.New(tokenfile.New(map[string]*user.DefaultInfo{
+		controlPlaneConfig := framework.NewIntegrationTestControlPlaneConfig()
+		controlPlaneConfig.GenericConfig.Authorization.Authorizer = newRBACAuthorizer(t, controlPlaneConfig)
+		controlPlaneConfig.GenericConfig.Authentication.Authenticator = bearertoken.New(tokenfile.New(map[string]*user.DefaultInfo{
 			superUser:                          {Name: "admin", Groups: []string{"system:masters"}},
 			"any-rolebinding-writer":           {Name: "any-rolebinding-writer"},
 			"any-rolebinding-writer-namespace": {Name: "any-rolebinding-writer-namespace"},
@@ -534,8 +534,8 @@ func TestRBAC(t *testing.T) {
 			"limitrange-patcher":               {Name: "limitrange-patcher"},
 			"user-with-no-permissions":         {Name: "user-with-no-permissions"},
 		}))
-		masterConfig.GenericConfig.OpenAPIConfig = framework.DefaultOpenAPIConfig()
-		_, s, closeFn := framework.RunAMaster(masterConfig)
+		controlPlaneConfig.GenericConfig.OpenAPIConfig = framework.DefaultOpenAPIConfig()
+		_, s, closeFn := framework.RunAnAPIServer(controlPlaneConfig)
 		defer closeFn()
 
 		clientConfig := &restclient.Config{Host: s.URL, ContentConfig: restclient.ContentConfig{NegotiatedSerializer: legacyscheme.Codecs}}
@@ -642,12 +642,12 @@ func TestRBAC(t *testing.T) {
 func TestBootstrapping(t *testing.T) {
 	superUser := "admin/system:masters"
 
-	masterConfig := framework.NewIntegrationTestMasterConfig()
-	masterConfig.GenericConfig.Authorization.Authorizer = newRBACAuthorizer(t, masterConfig)
-	masterConfig.GenericConfig.Authentication.Authenticator = bearertoken.New(tokenfile.New(map[string]*user.DefaultInfo{
+	controlPlaneConfig := framework.NewIntegrationTestControlPlaneConfig()
+	controlPlaneConfig.GenericConfig.Authorization.Authorizer = newRBACAuthorizer(t, controlPlaneConfig)
+	controlPlaneConfig.GenericConfig.Authentication.Authenticator = bearertoken.New(tokenfile.New(map[string]*user.DefaultInfo{
 		superUser: {Name: "admin", Groups: []string{"system:masters"}},
 	}))
-	_, s, closeFn := framework.RunAMaster(masterConfig)
+	_, s, closeFn := framework.RunAnAPIServer(controlPlaneConfig)
 	defer closeFn()
 
 	clientset := clientset.NewForConfigOrDie(&restclient.Config{BearerToken: superUser, Host: s.URL})
@@ -703,12 +703,12 @@ func TestDiscoveryUpgradeBootstrapping(t *testing.T) {
 
 	superUser := "admin/system:masters"
 
-	masterConfig := framework.NewIntegrationTestMasterConfig()
-	masterConfig.GenericConfig.Authorization.Authorizer = newRBACAuthorizer(t, masterConfig)
-	masterConfig.GenericConfig.Authentication.Authenticator = bearertoken.New(tokenfile.New(map[string]*user.DefaultInfo{
+	controlPlaneConfig := framework.NewIntegrationTestControlPlaneConfig()
+	controlPlaneConfig.GenericConfig.Authorization.Authorizer = newRBACAuthorizer(t, controlPlaneConfig)
+	controlPlaneConfig.GenericConfig.Authentication.Authenticator = bearertoken.New(tokenfile.New(map[string]*user.DefaultInfo{
 		superUser: {Name: "admin", Groups: []string{"system:masters"}},
 	}))
-	_, s, tearDownFn := framework.RunAMaster(masterConfig)
+	_, s, tearDownFn := framework.RunAnAPIServer(controlPlaneConfig)
 
 	client := clientset.NewForConfigOrDie(&restclient.Config{BearerToken: superUser, Host: s.URL})
 
@@ -752,7 +752,7 @@ func TestDiscoveryUpgradeBootstrapping(t *testing.T) {
 
 	// Check that upgraded API servers inherit `system:public-info-viewer` settings from
 	// `system:discovery`, and respect auto-reconciliation annotations.
-	_, s, tearDownFn = framework.RunAMaster(masterConfig)
+	_, s, tearDownFn = framework.RunAnAPIServer(controlPlaneConfig)
 
 	client = clientset.NewForConfigOrDie(&restclient.Config{BearerToken: superUser, Host: s.URL})
 

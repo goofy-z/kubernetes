@@ -20,7 +20,6 @@ import (
 	"bytes"
 	"context"
 	"fmt"
-	"os"
 	"text/template"
 	"time"
 
@@ -37,6 +36,8 @@ import (
 	"github.com/onsi/ginkgo"
 )
 
+// TODO: Cleanup this file.
+
 // Suite represents test suite.
 type Suite string
 
@@ -47,20 +48,13 @@ const (
 	NodeE2E Suite = "node e2e"
 )
 
-var (
-	// non-Administrator Windows user used in tests. This is the Windows equivalent of the Linux non-root UID usage.
-	nonAdminTestUserName = "ContainerUser"
-	// non-root UID used in tests.
-	nonRootTestUserID = int64(1000)
-)
-
 // CurrentSuite represents current test suite.
 var CurrentSuite Suite
 
 // PrePulledImages are a list of images used in e2e/common tests. These images should be prepulled
 // before tests starts, so that the tests won't fail due image pulling flakes.
 // Currently, this is only used by node e2e test.
-// See also updateImageWhiteList() in ../../e2e_node/image_list.go
+// See also updateImageAllowList() in ../../e2e_node/image_list.go
 // TODO(random-liu): Change the image puller pod to use similar mechanism.
 var PrePulledImages = sets.NewString(
 	imageutils.GetE2EImage(imageutils.Agnhost),
@@ -161,7 +155,9 @@ func RestartNodes(c clientset.Interface, nodes []v1.Node) error {
 	for i := range nodes {
 		node := &nodes[i]
 		zone := framework.TestContext.CloudConfig.Zone
-		if z, ok := node.Labels[v1.LabelZoneFailureDomain]; ok {
+		if z, ok := node.Labels[v1.LabelFailureDomainBetaZone]; ok {
+			zone = z
+		} else if z, ok := node.Labels[v1.LabelTopologyZone]; ok {
 			zone = z
 		}
 		nodeNamesByZone[zone] = append(nodeNamesByZone[zone], node.Name)
@@ -209,35 +205,4 @@ func rcByNamePort(name string, replicas int32, image string, containerArgs []str
 		Args:  containerArgs,
 		Ports: []v1.ContainerPort{{ContainerPort: int32(port), Protocol: protocol}},
 	}, gracePeriod)
-}
-
-// setPodNonRootUser configures the Pod to run as a non-root user.
-// For Windows, it sets the RunAsUserName field to ContainerUser, and for Linux, it sets the RunAsUser field to 1000.
-func setPodNonRootUser(pod *v1.Pod) {
-	if framework.NodeOSDistroIs("windows") {
-		pod.Spec.SecurityContext.WindowsOptions = &v1.WindowsSecurityContextOptions{RunAsUserName: &nonAdminTestUserName}
-	} else {
-		pod.Spec.SecurityContext.RunAsUser = &nonRootTestUserID
-	}
-}
-
-// getFileModeRegex returns a file mode related regex which should be matched by the mounttest pods' output.
-// If the given mask is nil, then the regex will contain the default OS file modes, which are 0644 for Linux and 0775 for Windows.
-func getFileModeRegex(filePath string, mask *int32) string {
-	var (
-		linuxMask   int32
-		windowsMask int32
-	)
-	if mask == nil {
-		linuxMask = int32(0644)
-		windowsMask = int32(0775)
-	} else {
-		linuxMask = *mask
-		windowsMask = *mask
-	}
-
-	linuxOutput := fmt.Sprintf("mode of file \"%s\": %v", filePath, os.FileMode(linuxMask))
-	windowsOutput := fmt.Sprintf("mode of Windows file \"%v\": %s", filePath, os.FileMode(windowsMask))
-
-	return fmt.Sprintf("(%s|%s)", linuxOutput, windowsOutput)
 }

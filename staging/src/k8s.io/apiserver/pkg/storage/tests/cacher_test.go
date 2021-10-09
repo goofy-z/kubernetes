@@ -22,6 +22,7 @@ import (
 	"reflect"
 	goruntime "runtime"
 	"strconv"
+	"sync"
 	"testing"
 	"time"
 
@@ -33,8 +34,8 @@ import (
 	"k8s.io/apimachinery/pkg/fields"
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/runtime/serializer"
-	"k8s.io/apimachinery/pkg/util/clock"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
 	"k8s.io/apimachinery/pkg/util/sets"
 	"k8s.io/apimachinery/pkg/util/wait"
@@ -50,6 +51,8 @@ import (
 	"k8s.io/apiserver/pkg/storage/value"
 	utilfeature "k8s.io/apiserver/pkg/util/feature"
 	featuregatetesting "k8s.io/component-base/featuregate/testing"
+	"k8s.io/utils/clock"
+	testingclock "k8s.io/utils/clock/testing"
 )
 
 var (
@@ -99,9 +102,12 @@ func AddObjectMetaFieldsSet(source fields.Set, objectMeta *metav1.ObjectMeta, ha
 	return source
 }
 
+func newPod() runtime.Object     { return &example.Pod{} }
+func newPodList() runtime.Object { return &example.PodList{} }
+
 func newEtcdTestStorage(t *testing.T, prefix string) (*etcd3testing.EtcdTestServer, storage.Interface) {
 	server, _ := etcd3testing.NewUnsecuredEtcd3TestClientServer(t)
-	storage := etcd3.New(server.V3Client, apitesting.TestCodec(codecs, examplev1.SchemeGroupVersion), prefix, value.IdentityTransformer, true)
+	storage := etcd3.New(server.V3Client, apitesting.TestCodec(codecs, examplev1.SchemeGroupVersion), newPod, prefix, schema.GroupResource{Resource: "pods"}, value.IdentityTransformer, true, etcd3.NewDefaultLeaseManagerConfig())
 	return server, storage
 }
 
@@ -118,8 +124,8 @@ func newTestCacherWithClock(s storage.Interface, clock clock.Clock) (*cacherstor
 		ResourcePrefix: prefix,
 		KeyFunc:        func(obj runtime.Object) (string, error) { return storage.NamespaceKeyFunc(prefix, obj) },
 		GetAttrsFunc:   GetAttrs,
-		NewFunc:        func() runtime.Object { return &example.Pod{} },
-		NewListFunc:    func() runtime.Object { return &example.PodList{} },
+		NewFunc:        newPod,
+		NewListFunc:    newPodList,
 		Codec:          codecs.LegacyCodec(examplev1.SchemeGroupVersion),
 		Clock:          clock,
 	}
@@ -145,7 +151,7 @@ func updatePod(t *testing.T, s storage.Interface, obj, old *example.Pod) *exampl
 		return obj.DeepCopyObject(), nil, nil
 	}
 	key := "pods/" + obj.Namespace + "/" + obj.Name
-	if err := s.GuaranteedUpdate(context.TODO(), key, &example.Pod{}, old == nil, nil, updateFn); err != nil {
+	if err := s.GuaranteedUpdate(context.TODO(), key, &example.Pod{}, old == nil, nil, updateFn, nil); err != nil {
 		t.Errorf("unexpected error: %v", err)
 	}
 	obj.ResourceVersion = ""
@@ -278,7 +284,7 @@ func TestList(t *testing.T) {
 	updatePod(t, etcdStorage, podFooNS2, nil)
 
 	deleted := example.Pod{}
-	if err := etcdStorage.Delete(context.TODO(), "pods/ns/bar", &deleted, nil, storage.ValidateAllObjectFunc); err != nil {
+	if err := etcdStorage.Delete(context.TODO(), "pods/ns/bar", &deleted, nil, storage.ValidateAllObjectFunc, nil); err != nil {
 		t.Errorf("Unexpected error: %v", err)
 	}
 
@@ -404,7 +410,7 @@ func TestWatch(t *testing.T) {
 	// Inject one list error to make sure we test the relist case.
 	etcdStorage = &injectListError{errors: 1, Interface: etcdStorage}
 	defer server.Terminate(t)
-	fakeClock := clock.NewFakeClock(time.Now())
+	fakeClock := testingclock.NewFakeClock(time.Now())
 	cacher, _, err := newTestCacherWithClock(etcdStorage, fakeClock)
 	if err != nil {
 		t.Fatalf("Couldn't create cacher: %v", err)
@@ -571,7 +577,7 @@ func TestFiltering(t *testing.T) {
 	_ = updatePod(t, etcdStorage, podFooPrime, fooUnfiltered)
 
 	deleted := example.Pod{}
-	if err := etcdStorage.Delete(context.TODO(), "pods/ns/foo", &deleted, nil, storage.ValidateAllObjectFunc); err != nil {
+	if err := etcdStorage.Delete(context.TODO(), "pods/ns/foo", &deleted, nil, storage.ValidateAllObjectFunc, nil); err != nil {
 		t.Errorf("Unexpected error: %v", err)
 	}
 
@@ -597,61 +603,6 @@ func TestFiltering(t *testing.T) {
 	verifyWatchEvent(t, watcher, watch.Added, podFoo)
 	verifyWatchEvent(t, watcher, watch.Modified, podFooPrime)
 	verifyWatchEvent(t, watcher, watch.Deleted, podFooPrime)
-}
-
-func TestStartingResourceVersion(t *testing.T) {
-	server, etcdStorage := newEtcdTestStorage(t, etcd3testing.PathPrefix())
-	defer server.Terminate(t)
-	cacher, v, err := newTestCacher(etcdStorage)
-	if err != nil {
-		t.Fatalf("Couldn't create cacher: %v", err)
-	}
-	defer cacher.Stop()
-
-	// add 1 object
-	podFoo := makeTestPod("foo")
-	fooCreated := updatePod(t, etcdStorage, podFoo, nil)
-
-	// Set up Watch starting at fooCreated.ResourceVersion + 10
-	rv, err := v.ParseResourceVersion(fooCreated.ResourceVersion)
-	if err != nil {
-		t.Fatalf("Unexpected error: %v", err)
-	}
-	rv += 10
-	startVersion := strconv.Itoa(int(rv))
-
-	watcher, err := cacher.Watch(context.TODO(), "pods/ns/foo", storage.ListOptions{ResourceVersion: startVersion, Predicate: storage.Everything})
-	if err != nil {
-		t.Fatalf("Unexpected error: %v", err)
-	}
-	defer watcher.Stop()
-
-	lastFoo := fooCreated
-	for i := 0; i < 11; i++ {
-		podFooForUpdate := makeTestPod("foo")
-		podFooForUpdate.Labels = map[string]string{"foo": strconv.Itoa(i)}
-		lastFoo = updatePod(t, etcdStorage, podFooForUpdate, lastFoo)
-	}
-
-	select {
-	case e := <-watcher.ResultChan():
-		object := e.Object
-		if co, ok := object.(runtime.CacheableObject); ok {
-			object = co.GetObject()
-		}
-		pod := object.(*example.Pod)
-		podRV, err := v.ParseResourceVersion(pod.ResourceVersion)
-		if err != nil {
-			t.Fatalf("unexpected error: %v", err)
-		}
-
-		// event should have at least rv + 1, since we're starting the watch at rv
-		if podRV <= rv {
-			t.Errorf("expected event with resourceVersion of at least %d, got %d", rv+1, podRV)
-		}
-	case <-time.After(wait.ForeverTestTimeout):
-		t.Errorf("timed out waiting for event")
-	}
 }
 
 func TestEmptyWatchEventCache(t *testing.T) {
@@ -938,8 +889,13 @@ func TestWatchBookmarksWithCorrectResourceVersion(t *testing.T) {
 	defer watcher.Stop()
 
 	done := make(chan struct{})
-	defer close(done)
+	errc := make(chan error, 1)
+	var wg sync.WaitGroup
+	wg.Add(1)
+	defer wg.Wait()   // We must wait for the waitgroup to exit before we terminate the cache or the server in prior defers
+	defer close(done) // call close first, so the goroutine knows to exit
 	go func() {
+		defer wg.Done()
 		for i := 0; i < 100; i++ {
 			select {
 			case <-done:
@@ -948,7 +904,8 @@ func TestWatchBookmarksWithCorrectResourceVersion(t *testing.T) {
 				pod := fmt.Sprintf("foo-%d", i)
 				err := createPod(etcdStorage, makeTestPod(pod))
 				if err != nil {
-					t.Fatalf("failed to create pod %v: %v", pod, err)
+					errc <- fmt.Errorf("failed to create pod %v: %v", pod, err)
+					return
 				}
 				time.Sleep(time.Second / 100)
 			}
@@ -957,27 +914,36 @@ func TestWatchBookmarksWithCorrectResourceVersion(t *testing.T) {
 
 	bookmarkReceived := false
 	lastObservedResourceVersion := uint64(0)
-	for event := range watcher.ResultChan() {
-		rv, err := v.ObjectResourceVersion(event.Object)
-		if err != nil {
-			t.Fatalf("failed to parse resourceVersion from %#v", event)
-		}
-		if event.Type == watch.Bookmark {
-			bookmarkReceived = true
-			// bookmark event has a RV greater than or equal to the before one
-			if rv < lastObservedResourceVersion {
-				t.Fatalf("Unexpected bookmark resourceVersion %v less than observed %v)", rv, lastObservedResourceVersion)
+
+	for {
+		select {
+		case err := <-errc:
+			t.Fatal(err)
+		case event, ok := <-watcher.ResultChan():
+			if !ok {
+				// Make sure we have received a bookmark event
+				if !bookmarkReceived {
+					t.Fatalf("Unpexected error, we did not received a bookmark event")
+				}
+				return
 			}
-		} else {
-			// non-bookmark event has a RV greater than anything before
-			if rv <= lastObservedResourceVersion {
-				t.Fatalf("Unexpected event resourceVersion %v less than or equal to bookmark %v)", rv, lastObservedResourceVersion)
+			rv, err := v.ObjectResourceVersion(event.Object)
+			if err != nil {
+				t.Fatalf("failed to parse resourceVersion from %#v", event)
 			}
+			if event.Type == watch.Bookmark {
+				bookmarkReceived = true
+				// bookmark event has a RV greater than or equal to the before one
+				if rv < lastObservedResourceVersion {
+					t.Fatalf("Unexpected bookmark resourceVersion %v less than observed %v)", rv, lastObservedResourceVersion)
+				}
+			} else {
+				// non-bookmark event has a RV greater than anything before
+				if rv <= lastObservedResourceVersion {
+					t.Fatalf("Unexpected event resourceVersion %v less than or equal to bookmark %v)", rv, lastObservedResourceVersion)
+				}
+			}
+			lastObservedResourceVersion = rv
 		}
-		lastObservedResourceVersion = rv
-	}
-	// Make sure we have received a bookmark event
-	if !bookmarkReceived {
-		t.Fatalf("Unpexected error, we did not received a bookmark event")
 	}
 }

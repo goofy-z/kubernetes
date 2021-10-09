@@ -21,11 +21,13 @@ import (
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	kruntime "k8s.io/apimachinery/pkg/runtime"
+	componentbaseconfigv1alpha1 "k8s.io/component-base/config/v1alpha1"
 	kubeletconfigv1beta1 "k8s.io/kubelet/config/v1beta1"
+
 	// TODO: Cut references to k8s.io/kubernetes, eventually there should be none from this package
+	"k8s.io/kubernetes/pkg/cluster/ports"
 	"k8s.io/kubernetes/pkg/kubelet/qos"
 	kubetypes "k8s.io/kubernetes/pkg/kubelet/types"
-	"k8s.io/kubernetes/pkg/master/ports"
 	utilpointer "k8s.io/utils/pointer"
 )
 
@@ -34,6 +36,9 @@ const (
 	DefaultIPTablesMasqueradeBit = 14
 	DefaultIPTablesDropBit       = 15
 	DefaultVolumePluginDir       = "/usr/libexec/kubernetes/kubelet-plugins/volume/exec/"
+
+	// See https://github.com/kubernetes/enhancements/tree/master/keps/sig-node/2570-memory-qos
+	DefaultMemoryThrottlingFactor = 0.8
 )
 
 var (
@@ -153,8 +158,14 @@ func SetDefaults_KubeletConfiguration(obj *kubeletconfigv1beta1.KubeletConfigura
 		// Keep the same as default NodeStatusUpdateFrequency
 		obj.CPUManagerReconcilePeriod = metav1.Duration{Duration: 10 * time.Second}
 	}
+	if obj.MemoryManagerPolicy == "" {
+		obj.MemoryManagerPolicy = kubeletconfigv1beta1.NoneMemoryManagerPolicy
+	}
 	if obj.TopologyManagerPolicy == "" {
 		obj.TopologyManagerPolicy = kubeletconfigv1beta1.NoneTopologyManagerPolicy
+	}
+	if obj.TopologyManagerScope == "" {
+		obj.TopologyManagerScope = kubeletconfigv1beta1.ContainerTopologyManagerScope
 	}
 	if obj.RuntimeRequestTimeout == zeroDuration {
 		obj.RuntimeRequestTimeout = metav1.Duration{Duration: 2 * time.Minute}
@@ -167,11 +178,11 @@ func SetDefaults_KubeletConfiguration(obj *kubeletconfigv1beta1.KubeletConfigura
 	}
 	// default nil or negative value to -1 (implies node allocatable pid limit)
 	if obj.PodPidsLimit == nil || *obj.PodPidsLimit < int64(0) {
-		temp := int64(-1)
-		obj.PodPidsLimit = &temp
+		obj.PodPidsLimit = utilpointer.Int64(-1)
 	}
-	if obj.ResolverConfig == "" {
-		obj.ResolverConfig = kubetypes.ResolvConfDefault
+
+	if obj.ResolverConfig == nil {
+		obj.ResolverConfig = utilpointer.String(kubetypes.ResolvConfDefault)
 	}
 	if obj.CPUCFSQuota == nil {
 		obj.CPUCFSQuota = utilpointer.BoolPtr(true)
@@ -232,5 +243,22 @@ func SetDefaults_KubeletConfiguration(obj *kubeletconfigv1beta1.KubeletConfigura
 	}
 	if obj.VolumePluginDir == "" {
 		obj.VolumePluginDir = DefaultVolumePluginDir
+	}
+	// Use the Default LoggingConfiguration option
+	componentbaseconfigv1alpha1.RecommendedLoggingConfiguration(&obj.Logging)
+	if obj.EnableSystemLogHandler == nil {
+		obj.EnableSystemLogHandler = utilpointer.BoolPtr(true)
+	}
+	if obj.EnableProfilingHandler == nil {
+		obj.EnableProfilingHandler = utilpointer.BoolPtr(true)
+	}
+	if obj.EnableDebugFlagsHandler == nil {
+		obj.EnableDebugFlagsHandler = utilpointer.BoolPtr(true)
+	}
+	if obj.SeccompDefault == nil {
+		obj.SeccompDefault = utilpointer.BoolPtr(false)
+	}
+	if obj.MemoryThrottlingFactor == nil {
+		obj.MemoryThrottlingFactor = utilpointer.Float64Ptr(DefaultMemoryThrottlingFactor)
 	}
 }

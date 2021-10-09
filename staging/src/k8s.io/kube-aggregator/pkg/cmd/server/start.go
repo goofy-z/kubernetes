@@ -17,9 +17,9 @@ limitations under the License.
 package server
 
 import (
+	"errors"
 	"fmt"
 	"io"
-	"io/ioutil"
 
 	"github.com/spf13/cobra"
 	"github.com/spf13/pflag"
@@ -142,6 +142,9 @@ func (o AggregatorOptions) RunAggregator(stopCh <-chan struct{}) error {
 	)
 	serverConfig.OpenAPIConfig = genericapiserver.DefaultOpenAPIConfig(openapi.GetOpenAPIDefinitions, openapinamer.NewDefinitionNamer(aggregatorscheme.Scheme))
 	serverConfig.OpenAPIConfig.Info.Title = "kube-aggregator"
+	// prevent generic API server from installing the OpenAPI handler. Aggregator server
+	// has its own customized OpenAPI handler.
+	serverConfig.SkipOpenAPIInstallation = true
 
 	serviceResolver := apiserver.NewClusterIPServiceResolver(serverConfig.SharedInformerFactory.Core().V1().Services().Lister())
 
@@ -152,15 +155,12 @@ func (o AggregatorOptions) RunAggregator(stopCh <-chan struct{}) error {
 		},
 	}
 
-	var err error
-	config.ExtraConfig.ProxyClientCert, err = ioutil.ReadFile(o.ProxyClientCertFile)
-	if err != nil {
-		return err
+	if len(o.ProxyClientCertFile) == 0 || len(o.ProxyClientKeyFile) == 0 {
+		return errors.New("missing a client certificate along with a key to identify the proxy to the API server")
 	}
-	config.ExtraConfig.ProxyClientKey, err = ioutil.ReadFile(o.ProxyClientKeyFile)
-	if err != nil {
-		return err
-	}
+
+	config.ExtraConfig.ProxyClientCertFile = o.ProxyClientCertFile
+	config.ExtraConfig.ProxyClientKeyFile = o.ProxyClientKeyFile
 
 	server, err := config.Complete().NewWithDelegate(genericapiserver.NewEmptyDelegate())
 	if err != nil {

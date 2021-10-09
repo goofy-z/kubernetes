@@ -140,15 +140,12 @@ func (s *simpleProvider) mutateContainer(pod *api.Pod, container *api.Container)
 		sc.SetRunAsUser(uid)
 	}
 
-	if utilfeature.DefaultFeatureGate.Enabled(features.RunAsGroup) {
-		if sc.RunAsGroup() == nil {
-			gid, err := s.strategies.RunAsGroupStrategy.GenerateSingle(pod)
-			if err != nil {
-				return err
-			}
-			sc.SetRunAsGroup(gid)
+	if sc.RunAsGroup() == nil {
+		gid, err := s.strategies.RunAsGroupStrategy.GenerateSingle(pod)
+		if err != nil {
+			return err
 		}
-
+		sc.SetRunAsGroup(gid)
 	}
 
 	if sc.SELinuxOptions() == nil {
@@ -239,7 +236,7 @@ func (s *simpleProvider) ValidatePod(pod *api.Pod) field.ErrorList {
 		allErrs = append(allErrs, validateRuntimeClassName(pod.Spec.RuntimeClassName, s.psp.Spec.RuntimeClass.AllowedRuntimeClassNames)...)
 	}
 
-	pods.VisitContainersWithPath(&pod.Spec, func(c *api.Container, p *field.Path) bool {
+	pods.VisitContainersWithPath(&pod.Spec, field.NewPath("spec"), func(c *api.Container, p *field.Path) bool {
 		allErrs = append(allErrs, s.validateContainer(pod, c, p)...)
 		return true
 	})
@@ -276,7 +273,7 @@ func (s *simpleProvider) validatePodVolumes(pod *api.Pod) field.ErrorList {
 						fmt.Sprintf("is not allowed to be used")))
 				} else if mustBeReadOnly {
 					// Ensure all the VolumeMounts that use this volume are read-only
-					pods.VisitContainersWithPath(&pod.Spec, func(c *api.Container, p *field.Path) bool {
+					pods.VisitContainersWithPath(&pod.Spec, field.NewPath("spec"), func(c *api.Container, p *field.Path) bool {
 						for i, cv := range c.VolumeMounts {
 							if cv.Name == v.Name && !cv.ReadOnly {
 								allErrs = append(allErrs, field.Invalid(p.Child("volumeMounts").Index(i).Child("readOnly"), cv.ReadOnly, "must be read-only"))
@@ -337,14 +334,12 @@ func (s *simpleProvider) validateContainer(pod *api.Pod, container *api.Containe
 
 	scPath := containerPath.Child("securityContext")
 	allErrs = append(allErrs, s.strategies.RunAsUserStrategy.Validate(scPath, pod, container, sc.RunAsNonRoot(), sc.RunAsUser())...)
-
-	if utilfeature.DefaultFeatureGate.Enabled(features.RunAsGroup) {
-		var runAsGroups []int64
-		if sc.RunAsGroup() != nil {
-			runAsGroups = []int64{*sc.RunAsGroup()}
-		}
-		allErrs = append(allErrs, s.strategies.RunAsGroupStrategy.Validate(scPath, pod, runAsGroups)...)
+	var runAsGroups []int64
+	if sc.RunAsGroup() != nil {
+		runAsGroups = []int64{*sc.RunAsGroup()}
 	}
+	allErrs = append(allErrs, s.strategies.RunAsGroupStrategy.Validate(scPath, pod, runAsGroups)...)
+
 	allErrs = append(allErrs, s.strategies.SELinuxStrategy.Validate(scPath.Child("seLinuxOptions"), pod, container, sc.SELinuxOptions())...)
 	allErrs = append(allErrs, s.strategies.AppArmorStrategy.Validate(pod, container)...)
 	allErrs = append(allErrs, s.strategies.SeccompStrategy.ValidateContainer(pod, container)...)
